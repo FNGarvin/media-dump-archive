@@ -1,0 +1,83 @@
+From cbc2bcf0a7441bd7d901e5b2bfeeb6a01ef287af Mon Sep 17 00:00:00 2001
+From: FNGarvin <184324400+FNGarvin@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 16:19:48 -0500
+Subject: [PATCH 04/12] Fix filepicker crash and leading non-keyframe video
+ corruption
+
+nsContextMenu.sys.mjs: this.browser.ownerGlobal was undefined in this
+context, throwing before the folder picker could open. Use this.window
+(already set to the chrome window elsewhere in this file) instead.
+
+MediaDumpMuxer: the "drop non-keyframe video until started" guard checked
+the shared mHasWrittenCluster flag, but audio has no such dependency and
+can open the first cluster before any video keyframe arrives. That let a
+non-keyframe video sample -- undecodable without a preceding reference
+frame -- get written as the first video sample in the file, corrupting
+playback ("Invalid frame marker" from ffmpeg) and desyncing the block's
+cluster-relative timecode. Track video's own start state separately.
+---
+ browser/base/content/nsContextMenu.sys.mjs |  2 +-
+ dom/media/MediaDumpMuxer.cpp               | 15 ++++++++++++---
+ dom/media/MediaDumpMuxer.h                 |  7 +++++++
+ 3 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/browser/base/content/nsContextMenu.sys.mjs b/browser/base/content/nsContextMenu.sys.mjs
+index d74f708a30be..f87e986ae065 100644
+--- a/browser/base/content/nsContextMenu.sys.mjs
++++ b/browser/base/content/nsContextMenu.sys.mjs
+@@ -2631,7 +2631,7 @@ export class nsContextMenu {
+       Ci.nsIFilePicker
+     );
+     fp.init(
+-      this.browser.ownerGlobal.browsingContext,
++      this.window.browsingContext,
+       "Choose a folder to dump the media stream to",
+       Ci.nsIFilePicker.modeGetFolder
+     );
+diff --git a/dom/media/MediaDumpMuxer.cpp b/dom/media/MediaDumpMuxer.cpp
+index deb8ce42ef90..f455e11cc4f8 100644
+--- a/dom/media/MediaDumpMuxer.cpp
++++ b/dom/media/MediaDumpMuxer.cpp
+@@ -192,9 +192,18 @@ void MediaDumpMuxer::WriteSample(bool aIsVideo, MediaRawData* aSample) {
+   }
+ 
+   const bool isVideoKeyframe = aIsVideo && aSample->mKeyframe;
+-  if (aIsVideo && !aSample->mKeyframe && !mHasWrittenCluster) {
+-    // Never start the file on a non-keyframe video sample.
+-    return;
++  if (aIsVideo) {
++    if (!aSample->mKeyframe && !mVideoStarted) {
++      // Never write a non-keyframe video sample before the first keyframe
++      // -- it has no preceding reference frame in the file and is
++      // undecodable. Independent of mHasWrittenCluster: audio may have
++      // already opened a cluster by the time video's first keyframe shows
++      // up, and that must not defeat this check.
++      return;
++    }
++    if (aSample->mKeyframe) {
++      mVideoStarted = true;
++    }
+   }
+ 
+   const int64_t sampleTimeMs = aSample->mTime.ToMilliseconds();
+diff --git a/dom/media/MediaDumpMuxer.h b/dom/media/MediaDumpMuxer.h
+index 8ca62c3d1d1c..b8c5bc17adff 100644
+--- a/dom/media/MediaDumpMuxer.h
++++ b/dom/media/MediaDumpMuxer.h
+@@ -93,6 +93,13 @@ class MediaDumpMuxer final {
+   bool mHasWrittenCluster = false;
+   int64_t mCurrentClusterTimecodeMs = 0;
+ 
++  // True once the first video *keyframe* has been written. Deliberately
++  // separate from mHasWrittenCluster: audio has no such dependency and may
++  // open the first cluster before any video keyframe has arrived, and video
++  // must keep dropping leading non-keyframe samples regardless of that --
++  // a P-frame with no preceding reference in the file is undecodable.
++  bool mVideoStarted = false;
++
+   RefPtr<TaskQueue> mTaskQueue;
+   RefPtr<MediaDumpSink> mSink;
+ };
+-- 
+2.46.0.windows.1
+

@@ -1,0 +1,159 @@
+From e946055321540ecd8e92a3435c53a6419483230c Mon Sep 17 00:00:00 2001
+From: FNGarvin <184324400+FNGarvin@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 17:25:33 -0500
+Subject: [PATCH 06/12] Add H.264 video and AAC audio codec support to
+ MediaDumpMuxer
+
+Both turned out to need zero bitstream reformatting, contrary to earlier
+assumptions:
+- VideoInfo::mExtraData for video/avc is the avcC box's own content
+  (AVCDecoderConfigurationRecord) verbatim, and sample data is already
+  AVCC length-prefixed NALs -- confirmed via the real MP4 demux path in
+  dom/media/mp4/DecoderData.cpp and WMFVideoMFTManager.cpp feeding
+  aSample->Data()/Size() straight to the platform decoder untouched.
+- AacCodecSpecificData::mDecoderConfigDescriptorBinaryBlob (already
+  reachable through the existing ForceGetAudioCodecSpecificBlob() call)
+  is already the bare AudioSpecificConfig despite its name -- confirmed
+  via WMFAudioMFTManager.cpp treating it as exactly that with no
+  ES_Descriptor unwrapping.
+
+Only real gap was that libmkv's own writeVideoTrack() has no way to write
+a CodecPrivate element (VP8/VP9 don't need one, H.264 does), so video
+TrackEntry writing is now done directly via the same low-level EBML
+primitives instead of touching that shared/vendored helper.
+---
+ dom/media/MediaDumpMuxer.cpp | 72 ++++++++++++++++++++++++++++++++----
+ dom/media/MediaDumpMuxer.h   |  6 +--
+ 2 files changed, 68 insertions(+), 10 deletions(-)
+
+diff --git a/dom/media/MediaDumpMuxer.cpp b/dom/media/MediaDumpMuxer.cpp
+index 6f10ffec3dee..ef58af4fd8f9 100644
+--- a/dom/media/MediaDumpMuxer.cpp
++++ b/dom/media/MediaDumpMuxer.cpp
+@@ -38,10 +38,17 @@ static nsAutoCString MapVideoCodecId(const nsCString& aMimeType) {
+     id.AssignLiteral("V_VP8");
+   } else if (aMimeType.EqualsLiteral("video/vp9")) {
+     id.AssignLiteral("V_VP9");
++  } else if (aMimeType.EqualsLiteral("video/avc")) {
++    // VideoInfo::mExtraData for this mime type is the avcC box's own
++    // content (AVCDecoderConfigurationRecord) verbatim -- confirmed via
++    // dom/media/mp4/DecoderData.cpp's real demux-path population and via
++    // WMFVideoMFTManager.cpp feeding aSample->Data()/Size() straight to
++    // the platform decoder with no transform, so the sample bitstream
++    // itself (AVCC length-prefixed NALs) needs no reformatting either --
++    // exactly the CodecPrivate/sample format Matroska expects here.
++    id.AssignLiteral("V_MPEG4/ISO/AVC");
+   }
+-  // video/avc (H.264), video/av1, etc. intentionally not yet supported --
+-  // H.264 and AAC need extra codec-private reformatting (avcC / bare
+-  // AudioSpecificConfig extraction) not yet implemented here.
++  // video/av1, video/hevc, etc. not yet supported.
+   return id;
+ }
+ 
+@@ -51,10 +58,56 @@ static nsAutoCString MapAudioCodecId(const nsCString& aMimeType) {
+     id.AssignLiteral("A_OPUS");
+   } else if (aMimeType.EqualsLiteral("audio/vorbis")) {
+     id.AssignLiteral("A_VORBIS");
++  } else if (aMimeType.EqualsLiteral("audio/mp4a-latm")) {
++    // AacCodecSpecificData::mDecoderConfigDescriptorBinaryBlob (returned by
++    // ForceGetAudioCodecSpecificBlob below) is already the bare
++    // AudioSpecificConfig despite its name -- confirmed via
++    // WMFAudioMFTManager.cpp treating it as exactly that ("audioSpecConfig")
++    // with no unwrapping, so no ES_Descriptor stripping is needed here.
++    id.AssignLiteral("A_AAC");
+   }
+   return id;
+ }
+ 
++// libmkv's own writeVideoTrack() (media/libmkv/WebMElement.c) has no way to
++// write a CodecPrivate element, which VP8/VP9 don't need but H.264 (avcC)
++// does -- so this writes the video TrackEntry directly via the same
++// low-level EBML primitives writeVideoTrack itself uses, instead of
++// touching that shared/vendored helper. aCodecPrivate may be null/empty.
++static void WriteVideoTrackEntry(EbmlGlobal* aEbml, uint8_t aTrackNumber,
++                                 const char* aCodecId,
++                                 const MediaByteBuffer* aCodecPrivate,
++                                 uint32_t aPixelWidth, uint32_t aPixelHeight,
++                                 uint32_t aDisplayWidth,
++                                 uint32_t aDisplayHeight) {
++  EbmlLoc trackLoc;
++  Ebml_StartSubElement(aEbml, &trackLoc, TrackEntry);
++  Ebml_SerializeUnsigned(aEbml, TrackNumber, aTrackNumber);
++  Ebml_SerializeUnsigned(aEbml, TrackUID, aTrackNumber);
++  Ebml_SerializeUnsigned(aEbml, TrackType, 1);  // video is always 1
++  Ebml_SerializeString(aEbml, CodecID, aCodecId);
++  if (aCodecPrivate && aCodecPrivate->Length()) {
++    Ebml_SerializeData(
++        aEbml, CodecPrivate,
++        const_cast<unsigned char*>(aCodecPrivate->Elements()),
++        aCodecPrivate->Length());
++  }
++  {
++    EbmlLoc videoLoc;
++    Ebml_StartSubElement(aEbml, &videoLoc, Video);
++    Ebml_SerializeUnsigned(aEbml, PixelWidth, aPixelWidth);
++    Ebml_SerializeUnsigned(aEbml, PixelHeight, aPixelHeight);
++    if (aPixelWidth != aDisplayWidth) {
++      Ebml_SerializeUnsigned(aEbml, DisplayWidth, aDisplayWidth);
++    }
++    if (aPixelHeight != aDisplayHeight) {
++      Ebml_SerializeUnsigned(aEbml, DisplayHeight, aDisplayHeight);
++    }
++    Ebml_EndSubElement(aEbml, &videoLoc);
++  }
++  Ebml_EndSubElement(aEbml, &trackLoc);
++}
++
+ void MediaDumpSink::Write(const nsTArray<uint8_t>& aBytes) {
+   if (!mFile && !mOpenAttempted) {
+     mOpenAttempted = true;
+@@ -120,9 +173,13 @@ void MediaDumpMuxer::Init(const nsACString& aDirPath, const VideoInfo* aVideo,
+   if (mHasAudio) {
+     audioPrivate = ForceGetAudioCodecSpecificBlob(aAudio->mCodecSpecificConfig);
+   }
++  // Only non-empty for codecs that need it (H.264's avcC); VP8/VP9 leave
++  // VideoInfo::mExtraData empty and WriteVideoTrackEntry skips CodecPrivate.
++  RefPtr<MediaByteBuffer> videoPrivate = mHasVideo ? aVideo->mExtraData : nullptr;
+ 
+   auto bufSize = size_t(kHeaderBudget) +
+-                 (audioPrivate ? audioPrivate->Length() : 0);
++                 (audioPrivate ? audioPrivate->Length() : 0) +
++                 (videoPrivate ? videoPrivate->Length() : 0);
+   auto buffer = MakeUnique<uint8_t[]>(bufSize);
+   EbmlGlobal ebml;
+   ebml.buf = buffer.get();
+@@ -141,9 +198,10 @@ void MediaDumpMuxer::Init(const nsACString& aDirPath, const VideoInfo* aVideo,
+       EbmlLoc trackLoc;
+       Ebml_StartSubElement(&ebml, &trackLoc, Tracks);
+       if (mHasVideo) {
+-        writeVideoTrack(&ebml, mVideoTrackNumber, 0, videoCodecId.get(),
+-                        aVideo->mImage.width, aVideo->mImage.height,
+-                        aVideo->mDisplay.width, aVideo->mDisplay.height);
++        WriteVideoTrackEntry(&ebml, mVideoTrackNumber, videoCodecId.get(),
++                             videoPrivate, aVideo->mImage.width,
++                             aVideo->mImage.height, aVideo->mDisplay.width,
++                             aVideo->mDisplay.height);
+       }
+       if (mHasAudio) {
+         writeAudioTrack(&ebml, mAudioTrackNumber, 0, audioCodecId.get(),
+diff --git a/dom/media/MediaDumpMuxer.h b/dom/media/MediaDumpMuxer.h
+index b8c5bc17adff..53a39fcfed22 100644
+--- a/dom/media/MediaDumpMuxer.h
++++ b/dom/media/MediaDumpMuxer.h
+@@ -50,9 +50,9 @@ class MediaDumpSink final {
+ // same ones WebMWriter/EbmlComposer use for MediaRecorder output), but --
+ // unlike EbmlComposer, which hardcodes VP8 video + Opus audio -- takes each
+ // track's actual codec ID and codec-private config from its TrackInfo, so
+-// it isn't tied to one codec pair. Currently wired up for VP8/VP9 video and
+-// Opus/Vorbis audio; unsupported codecs are simply not written (see
+-// MapVideoCodecId/MapAudioCodecId in the .cpp).
++// it isn't tied to one codec pair. Currently wired up for VP8/VP9/H.264
++// video and Opus/Vorbis/AAC audio; unsupported codecs (AV1, HEVC, ...) are
++// simply not written (see MapVideoCodecId/MapAudioCodecId in the .cpp).
+ //
+ // Must only be used from one thread/TaskQueue at a time (the owning
+ // MediaFormatReader's), except construction.
+-- 
+2.46.0.windows.1
+

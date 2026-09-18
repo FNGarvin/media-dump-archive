@@ -1,0 +1,387 @@
+From b27e1b17dc92c899464e5da9b96eb8056bb39d23 Mon Sep 17 00:00:00 2001
+From: FNGarvin <184324400+FNGarvin@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 22:37:54 -0500
+Subject: [PATCH 08/12] Write media dumps via the parent process instead of
+ requiring a disabled sandbox
+
+Adds PContent's RequestMediaDumpFile(path) returns (FileDescOrError), a
+new async IPC round trip modeled directly on the existing
+RequestAnonymousTemporaryFile/ProvideAnonymousTemporaryFile pattern
+(dom/ipc/ContentParent.cpp) and the CreateAudioIPCConnection "returns"
+call shape -- except it opens a caller-chosen named path (creating it,
+truncating if it exists) rather than an anonymous temp file, since the
+whole point here is a user-picked, persistent destination.
+
+The parent opens the file on an IO-capable thread and hands back a
+duplicated handle; the content side imports it back into a PRFileDesc via
+PR_ImportFile(), the same conversion ContentChild::RecvProvideAnonymousTemporaryFile
+already does for the temp-file case.
+
+MediaDumpSink now requests this handle once, asynchronously, instead of
+calling fopen()/PR_Open() directly on a path the content-process sandbox
+would normally block. Since that request is an unavoidable async
+round-trip, writes that arrive before the handle does are buffered (in
+order) and flushed once it arrives. Falls back to opening the path
+directly when there's no ContentChild singleton (i.e. running in the
+parent process itself, which has no sandbox restriction to route around).
+
+MOZ_DISABLE_CONTENT_SANDBOX is no longer required for this feature, though
+the run script still sets it for now as a safety net until this has seen
+more real-world testing.
+---
+ dom/ipc/ContentParent.cpp    |  76 ++++++++++++++++++++++
+ dom/ipc/ContentParent.h      |   3 +
+ dom/ipc/PContent.ipdl        |   9 +++
+ dom/media/MediaDumpMuxer.cpp | 122 +++++++++++++++++++++++++++++------
+ dom/media/MediaDumpMuxer.h   |  29 +++++++--
+ 5 files changed, 215 insertions(+), 24 deletions(-)
+
+diff --git a/dom/ipc/ContentParent.cpp b/dom/ipc/ContentParent.cpp
+index cd1a320435a0..7b1e0cc1e888 100644
+--- a/dom/ipc/ContentParent.cpp
++++ b/dom/ipc/ContentParent.cpp
+@@ -5174,6 +5174,82 @@ mozilla::ipc::IPCResult ContentParent::RecvCreateAudioIPCConnection(
+   return IPC_OK();
+ }
+ 
++// Opens (creating/truncating as needed) a named file on the IO thread and
++// hands a duplicated handle back to the child, mirroring
++// AnonymousTemporaryFileRequestor above but for a caller-chosen path
++// instead of an anonymous temp file, and replying via a resolver instead
++// of a second IPDL message. See MediaDumpMuxer.h for the content-side use.
++class MediaDumpFileRequestor final : public Runnable {
++ public:
++  MediaDumpFileRequestor(
++      const nsACString& aPath,
++      ContentParent::RequestMediaDumpFileResolver&& aResolver)
++      : Runnable("dom::MediaDumpFileRequestor"),
++        mPath(aPath),
++        mResolver(std::move(aResolver)),
++        mRv(NS_OK),
++        mPRFD(nullptr) {}
++
++  // Only safe to call if this runnable was never successfully dispatched
++  // (i.e. Run() will never execute) -- see RecvRequestMediaDumpFile.
++  void ResolveWithError() {
++    FileDescOrError result(NS_ERROR_FAILURE);
++    mResolver(result);
++  }
++
++  NS_IMETHOD Run() override {
++    if (NS_IsMainThread()) {
++      FileDescOrError result;
++      if (NS_WARN_IF(NS_FAILED(mRv))) {
++        result = mRv;
++      } else {
++        result = FileDescriptor(FileDescriptor::PlatformHandleType(
++            PR_FileDesc2NativeHandle(mPRFD)));
++        // The FileDescriptor object owns a duplicate of the file handle; we
++        // must close the original (and clean up the NSPR descriptor).
++        PR_Close(mPRFD);
++      }
++      mResolver(result);
++      return NS_OK;
++    }
++    mPRFD = PR_Open(mPath.get(), PR_WRONLY | PR_CREATE_FILE | PR_TRUNCATE, 0600);
++    if (!mPRFD) {
++      mRv = NS_ERROR_FAILURE;
++    }
++    NS_DispatchToMainThread(this);
++    return NS_OK;
++  }
++
++ private:
++  nsCString mPath;
++  ContentParent::RequestMediaDumpFileResolver mResolver;
++  nsresult mRv;
++  PRFileDesc* mPRFD;
++};
++
++mozilla::ipc::IPCResult ContentParent::RecvRequestMediaDumpFile(
++    const nsCString& aPath, RequestMediaDumpFileResolver&& aResolver) {
++  nsresult rv = NS_OK;
++  nsCOMPtr<nsIEventTarget> target =
++      do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID, &rv);
++  if (!target) {
++    FileDescOrError result(NS_ERROR_FAILURE);
++    aResolver(result);
++    return IPC_OK();
++  }
++
++  RefPtr<MediaDumpFileRequestor> requestor =
++      new MediaDumpFileRequestor(aPath, std::move(aResolver));
++  rv = target->Dispatch(requestor, NS_DISPATCH_NORMAL);
++  if (NS_WARN_IF(NS_FAILED(rv))) {
++    // Dispatch failed synchronously, so Run() never happened and never
++    // will; the resolver moved into requestor would otherwise be silently
++    // dropped without ever being invoked.
++    requestor->ResolveWithError();
++  }
++  return IPC_OK();
++}
++
+ #ifndef ANDROID
+ void ContentParent::EnsureHWInferenceConnection() {
+   // Re-acquiring unconditionally: a no-op when the process and its actor are
+diff --git a/dom/ipc/ContentParent.h b/dom/ipc/ContentParent.h
+index 473b5b04fb8c..60ed18f0adb4 100644
+--- a/dom/ipc/ContentParent.h
++++ b/dom/ipc/ContentParent.h
+@@ -1118,6 +1118,9 @@ class ContentParent final : public PContentParent,
+   mozilla::ipc::IPCResult RecvCreateAudioIPCConnection(
+       CreateAudioIPCConnectionResolver&& aResolver);
+ 
++  mozilla::ipc::IPCResult RecvRequestMediaDumpFile(
++      const nsCString& aPath, RequestMediaDumpFileResolver&& aResolver);
++
+ #ifndef ANDROID
+   // Points mHWInferenceKeepAlive at the live HWInference process, launching it
+   // if it is gone. Leaves it null once the restart budget is spent.
+diff --git a/dom/ipc/PContent.ipdl b/dom/ipc/PContent.ipdl
+index 37d385d306b9..496aab699633 100644
+--- a/dom/ipc/PContent.ipdl
++++ b/dom/ipc/PContent.ipdl
+@@ -1200,6 +1200,15 @@ parent:
+ 
+     async CreateAudioIPCConnection() returns (FileDescOrError fd);
+ 
++    /**
++     * Requests that the parent open (creating if necessary, truncating if it
++     * already exists) a named file at aPath for writing, and hand back a
++     * duplicated handle to it. Used so a sandboxed content process can save
++     * a user-chosen file (e.g. a media capture) without needing filesystem
++     * access of its own -- see MediaDumpMuxer.h.
++     */
++    async RequestMediaDumpFile(nsCString aPath) returns (FileDescOrError aFile);
++
+ #ifndef ANDROID
+     async AcquireHWInferenceProcess();
+     async CreateSpeechRecognition(Endpoint<PSpeechRecognitionParent> endpoint);
+diff --git a/dom/media/MediaDumpMuxer.cpp b/dom/media/MediaDumpMuxer.cpp
+index 31dd1d0886f9..efc4e9275dd3 100644
+--- a/dom/media/MediaDumpMuxer.cpp
++++ b/dom/media/MediaDumpMuxer.cpp
+@@ -14,13 +14,13 @@
+ #include "libmkv/WebMElement.h"
+ #include "mozilla/Atomics.h"
+ #include "mozilla/UniquePtr.h"
++#include "mozilla/dom/ContentChild.h"
++#include "mozilla/ipc/FileDescriptor.h"
+ #include "nsThreadUtils.h"
++#include "prio.h"
++#include "private/pprio.h"
+ #include "prtime.h"
+ 
+-#ifdef XP_WIN
+-#  include "nsString.h"
+-#endif
+-
+ namespace mozilla {
+ 
+ // Timecode scale in nanoseconds -- SimpleBlock timecodes below are in
+@@ -108,31 +108,112 @@ static void WriteVideoTrackEntry(EbmlGlobal* aEbml, uint8_t aTrackNumber,
+   Ebml_EndSubElement(aEbml, &trackLoc);
+ }
+ 
++void MediaDumpSink::RequestFileHandle(RefPtr<TaskQueue> aOwnerQueue) {
++  mOwnerQueue = std::move(aOwnerQueue);
++
++  if (!dom::ContentChild::GetSingleton()) {
++    // Not in a sandboxed content process (e.g. this is the parent process
++    // itself) -- nothing stops us from just opening the file directly.
++    // Still dispatched through mOwnerQueue rather than done inline: this
++    // may be called from a different queue (see MediaDumpMuxer::Init), and
++    // mFile/mPendingWrites must only ever be touched from mOwnerQueue.
++    RefPtr<MediaDumpSink> self = this;
++    nsCString path = mPath;
++    nsresult rv = mOwnerQueue->Dispatch(NS_NewRunnableFunction(
++        "MediaDumpSink::RequestFileHandle (direct open)",
++        [self, path]() {
++          PRFileDesc* file = PR_Open(
++              path.get(), PR_WRONLY | PR_CREATE_FILE | PR_TRUNCATE, 0600);
++          if (!file) {
++            NS_WARNING("MediaDumpMuxer: could not open dump file directly.");
++          }
++          self->OnFileHandleReady(file);
++        }));
++    NS_ENSURE_SUCCESS_VOID(rv);
++    return;
++  }
++
++  RefPtr<MediaDumpSink> self = this;
++  nsCString path = mPath;
++  // RequestFileHandle() itself may be called from any thread (see
++  // MediaDumpMuxer::Init), but the actual IPC call must happen on the main
++  // thread, matching every other PContent consumer. Re-fetch the singleton
++  // there rather than capturing it now, in case of a shutdown race between
++  // this dispatch and it actually running.
++  nsresult rv = NS_DispatchToMainThread(NS_NewRunnableFunction(
++      "MediaDumpSink::RequestFileHandle", [self, path]() {
++        dom::ContentChild* contentChild = dom::ContentChild::GetSingleton();
++        if (!contentChild) {
++          nsresult rv = self->mOwnerQueue->Dispatch(NS_NewRunnableFunction(
++              "MediaDumpSink::OnFileHandleReady",
++              [self]() { self->OnFileHandleReady(nullptr); }));
++          NS_ENSURE_SUCCESS_VOID(rv);
++          return;
++        }
++        contentChild->SendRequestMediaDumpFile(path)->Then(
++            GetMainThreadSerialEventTarget(), __func__,
++            [self](dom::FileDescOrError&& aResult) {
++              PRFileDesc* file = nullptr;
++              if (aResult.type() ==
++                  dom::FileDescOrError::Type::TFileDescriptor) {
++                auto rawFD =
++                    aResult.get_FileDescriptor().ClonePlatformHandle();
++                file = PR_ImportFile(PROsfd(rawFD.release()));
++              } else {
++                NS_WARNING(
++                    "MediaDumpMuxer: parent could not open dump file. Does "
++                    "the chosen path exist and is it writable?");
++              }
++              // Hand off to mOwnerQueue: mFile/mPendingWrites must only
++              // ever be touched from there.
++              nsresult rv = self->mOwnerQueue->Dispatch(NS_NewRunnableFunction(
++                  "MediaDumpSink::OnFileHandleReady",
++                  [self, file]() { self->OnFileHandleReady(file); }));
++              if (NS_FAILED(rv) && file) {
++                PR_Close(file);
++              }
++            },
++            [self](mozilla::ipc::ResponseRejectReason&&) {
++              nsresult rv = self->mOwnerQueue->Dispatch(
++                  NS_NewRunnableFunction("MediaDumpSink::OnFileHandleReady",
++                                        [self]() {
++                                          self->OnFileHandleReady(nullptr);
++                                        }));
++              NS_ENSURE_SUCCESS_VOID(rv);
++            });
++      }));
++  NS_ENSURE_SUCCESS_VOID(rv);
++}
++
++void MediaDumpSink::OnFileHandleReady(PRFileDesc* aFile) {
++  MOZ_ASSERT(!mFile);
++  if (!aFile) {
++    mRequestFailed = true;
++    mPendingWrites.Clear();
++    return;
++  }
++  mFile = aFile;
++  for (const auto& bytes : mPendingWrites) {
++    Write(bytes);
++  }
++  mPendingWrites.Clear();
++}
++
+ void MediaDumpSink::Write(const nsTArray<uint8_t>& aBytes) {
+-  if (!mFile && !mOpenAttempted) {
+-    mOpenAttempted = true;
+-#ifdef XP_WIN
+-    nsAutoString widePath = NS_ConvertUTF8toUTF16(mPath);
+-    mFile = _wfopen(widePath.get(), L"wb");
+-#else
+-    mFile = fopen(mPath.get(), "wb");
+-#endif
+-    if (!mFile) {
+-      NS_WARNING(
+-          "MediaDumpMuxer: could not open dump file. Is the content "
+-          "sandbox disabled (MOZ_DISABLE_CONTENT_SANDBOX=1)?");
+-    }
++  if (mRequestFailed) {
++    return;
+   }
+   if (!mFile) {
++    mPendingWrites.AppendElement(aBytes.Clone());
+     return;
+   }
+-  (void)fwrite(aBytes.Elements(), 1, aBytes.Length(), mFile);
+-  fflush(mFile);
++  (void)PR_Write(mFile, aBytes.Elements(), aBytes.Length());
++  PR_Sync(mFile);
+ }
+ 
+ MediaDumpSink::~MediaDumpSink() {
+   if (mFile) {
+-    fclose(mFile);
++    PR_Close(mFile);
+   }
+ }
+ 
+@@ -239,6 +320,7 @@ void MediaDumpMuxer::Init(const nsACString& aPathPrefix,
+   }
+   mTaskQueue = TaskQueue::Create(pool.forget(), "MediaDumpMuxer");
+ 
++  mSink->RequestFileHandle(mTaskQueue);
+   DispatchWrite(std::move(header));
+ }
+ 
+diff --git a/dom/media/MediaDumpMuxer.h b/dom/media/MediaDumpMuxer.h
+index d066807a5f5e..505e42db1aac 100644
+--- a/dom/media/MediaDumpMuxer.h
++++ b/dom/media/MediaDumpMuxer.h
+@@ -5,14 +5,14 @@
+ #ifndef mozilla_MediaDumpMuxer_h_
+ #define mozilla_MediaDumpMuxer_h_
+ 
+-#include <stdio.h>
+-
+ #include "mozilla/RefPtr.h"
+ #include "mozilla/TaskQueue.h"
+ #include "nsISupportsImpl.h"
+ #include "nsString.h"
+ #include "nsTArray.h"
+ 
++struct PRFileDesc;
++
+ namespace mozilla {
+ 
+ class MediaRawData;
+@@ -24,21 +24,42 @@ class AudioInfo;
+ // task instead of a raw pointer, so it stays alive exactly as long as there
+ // is queued work left, even if the owning MediaFormatReader is destroyed
+ // first (see MseDumpSink in the mediasource/ directory for the same idiom).
++//
++// A normal content-process tab can't just open an arbitrary path itself --
++// the content sandbox blocks that -- so opening happens in the parent
++// process via the PContent RequestMediaDumpFile IPC round trip (mirroring
++// how FileBlockCache gets an anonymous temp file from the parent, just for
++// a named, user-chosen path instead). That round trip is asynchronous, so
++// writes that arrive before the handle does are buffered in mPendingWrites
++// and flushed, in order, once it's ready.
+ class MediaDumpSink final {
+  public:
+   NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaDumpSink)
+ 
+   explicit MediaDumpSink(nsCString&& aPath) : mPath(std::move(aPath)) {}
+ 
++  // Must be called once, on the owning MediaDumpMuxer's TaskQueue, before
++  // any Write() call. Hops to the main thread to make the actual IPC call.
++  void RequestFileHandle(RefPtr<TaskQueue> aOwnerQueue);
++
+   // Must be called on the owning MediaDumpMuxer's TaskQueue.
+   void Write(const nsTArray<uint8_t>& aBytes);
+ 
+  private:
+   ~MediaDumpSink();
+ 
++  // Runs on mOwnerQueue once the parent has replied (or the request
++  // failed, in which case aFile is null and every future Write() is a
++  // silent no-op, matching this feature's existing "just drop it" failure
++  // mode when e.g. sandboxing prevented a local open in the direct-fopen
++  // predecessor of this class).
++  void OnFileHandleReady(PRFileDesc* aFile);
++
+   nsCString mPath;
+-  FILE* mFile = nullptr;
+-  bool mOpenAttempted = false;
++  RefPtr<TaskQueue> mOwnerQueue;
++  PRFileDesc* mFile = nullptr;
++  bool mRequestFailed = false;
++  nsTArray<nsTArray<uint8_t>> mPendingWrites;
+ };
+ 
+ // Muxes demuxed (compressed, pre-decode) audio/video samples into a single
+-- 
+2.46.0.windows.1
+

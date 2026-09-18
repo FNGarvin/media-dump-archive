@@ -1,0 +1,92 @@
+From f2278a896ff4b31674e8f37d66422b07c670fdf0 Mon Sep 17 00:00:00 2001
+From: FNGarvin <184324400+FNGarvin@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 12:28:10 -0500
+Subject: [PATCH 09/12] Diagnose unsupported-codec silent drops; remember last
+ dump folder
+
+MediaDumpMuxer now logs which mime type it couldn't map to a Matroska
+codec ID instead of silently omitting that track -- audio-only output
+with no video track at all (as opposed to a corrupted one) most likely
+means the video codec (e.g. AV1) just isn't in MapVideoCodecId's list yet,
+not a bug in the write path itself.
+
+dumpMediaStream()'s folder picker now uses DownloadLastDir, the same
+last-used-directory mechanism Save Page/Video/Image As already use,
+instead of asking every single time.
+---
+ browser/base/content/nsContextMenu.sys.mjs |  8 ++++++++
+ dom/media/MediaDumpMuxer.cpp               | 15 +++++++++++++++
+ 2 files changed, 23 insertions(+)
+
+diff --git a/browser/base/content/nsContextMenu.sys.mjs b/browser/base/content/nsContextMenu.sys.mjs
+index 33bee0d9abb2..c62d2216e20e 100644
+--- a/browser/base/content/nsContextMenu.sys.mjs
++++ b/browser/base/content/nsContextMenu.sys.mjs
+@@ -14,6 +14,7 @@ ChromeUtils.defineESModuleGetters(lazy, {
+   ContextualIdentityService:
+     "moz-src:///toolkit/components/contextualidentity/ContextualIdentityService.sys.mjs",
+   DevToolsShim: "chrome://devtools-startup/content/DevToolsShim.sys.mjs",
++  DownloadLastDir: "resource://gre/modules/DownloadLastDir.sys.mjs",
+   DownloadPaths: "resource://gre/modules/DownloadPaths.sys.mjs",
+   E10SUtils: "resource://gre/modules/E10SUtils.sys.mjs",
+   GenAI: "resource:///modules/GenAI.sys.mjs",
+@@ -2649,6 +2650,12 @@ export class nsContextMenu {
+         "Choose a folder to dump the media stream to",
+         Ci.nsIFilePicker.modeGetFolder
+       );
++      // Same "remember the last folder I picked" mechanism Save Page/Video/
++      // Image As already use, so this doesn't ask every single time.
++      const lastDir = new lazy.DownloadLastDir(this.window);
++      if (lastDir.file) {
++        fp.displayDirectory = lastDir.file;
++      }
+       fp.open(rv => {
+         if (
+           rv != Ci.nsIFilePicker.returnOK &&
+@@ -2656,6 +2663,7 @@ export class nsContextMenu {
+         ) {
+           return;
+         }
++        lastDir.file = fp.file;
+         // MediaDumpMuxer treats this as a filename prefix, not a bare
+         // directory -- it appends "-<timestamp>-<n>.mkv" itself. Build in
+         // the page title here so dumps are identifiable without having to
+diff --git a/dom/media/MediaDumpMuxer.cpp b/dom/media/MediaDumpMuxer.cpp
+index efc4e9275dd3..fdfb898498d4 100644
+--- a/dom/media/MediaDumpMuxer.cpp
++++ b/dom/media/MediaDumpMuxer.cpp
+@@ -16,6 +16,7 @@
+ #include "mozilla/UniquePtr.h"
+ #include "mozilla/dom/ContentChild.h"
+ #include "mozilla/ipc/FileDescriptor.h"
++#include "nsPrintfCString.h"
+ #include "nsThreadUtils.h"
+ #include "prio.h"
+ #include "private/pprio.h"
+@@ -236,9 +237,23 @@ void MediaDumpMuxer::Init(const nsACString& aPathPrefix,
+   nsAutoCString videoCodecId, audioCodecId;
+   if (aVideo) {
+     videoCodecId = MapVideoCodecId(aVideo->mMimeType);
++    if (videoCodecId.IsEmpty()) {
++      NS_WARNING(nsPrintfCString(
++                    "MediaDumpMuxer: unsupported video codec %s, dumping "
++                    "audio only (if present)",
++                    aVideo->mMimeType.get())
++                    .get());
++    }
+   }
+   if (aAudio) {
+     audioCodecId = MapAudioCodecId(aAudio->mMimeType);
++    if (audioCodecId.IsEmpty()) {
++      NS_WARNING(nsPrintfCString(
++                    "MediaDumpMuxer: unsupported audio codec %s, dumping "
++                    "video only (if present)",
++                    aAudio->mMimeType.get())
++                    .get());
++    }
+   }
+ 
+   mHasVideo = aVideo && !videoCodecId.IsEmpty();
+-- 
+2.46.0.windows.1
+

@@ -1,0 +1,138 @@
+From 8a4c2c65ab86057573701ba327eb677875254d28 Mon Sep 17 00:00:00 2001
+From: FNGarvin <184324400+FNGarvin@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 12:42:57 -0500
+Subject: [PATCH 10/12] Encode detected codecs into the dump filename instead
+ of console logging
+
+Discovered empirically that content-process stderr isn't visible via
+-attach-console the way the parent process's is: NS_WARNING is also a
+no-op outside DEBUG builds, which this one isn't, so neither approach
+actually surfaced anything, even for a dump that otherwise worked. The
+filename is the one place a content-process diagnostic can reliably reach
+the user, and doubles as a genuinely useful permanent feature: dumps are
+now suffixed with e.g. "-vp9-opus" or "-unsupported-video-av1-opus" so
+it's obvious at a glance why a track is or isn't in a given file.
+---
+ dom/media/MediaDumpMuxer.cpp | 68 +++++++++++++++++++++++++-----------
+ 1 file changed, 47 insertions(+), 21 deletions(-)
+
+diff --git a/dom/media/MediaDumpMuxer.cpp b/dom/media/MediaDumpMuxer.cpp
+index fdfb898498d4..8d20be0b1ff8 100644
+--- a/dom/media/MediaDumpMuxer.cpp
++++ b/dom/media/MediaDumpMuxer.cpp
+@@ -70,6 +70,37 @@ static nsAutoCString MapAudioCodecId(const nsCString& aMimeType) {
+   return id;
+ }
+ 
++// Short, filename-safe label for a resolved/unresolved codec, folded into
++// the dump's own filename below. This is deliberately not just a debug
++// aid: content-process stderr isn't visible via -attach-console the way
++// the parent process's is (confirmed empirically -- diagnostics logged
++// from here never showed up even for a dump that otherwise worked fine),
++// so the filename is the only reliably-visible place to explain why a
++// track did or didn't make it into the file.
++static nsAutoCString ShortCodecTag(const nsCString& aMimeType,
++                                   const nsAutoCString& aCodecId) {
++  nsAutoCString tag;
++  if (aCodecId.EqualsLiteral("V_VP8")) {
++    tag.AssignLiteral("vp8");
++  } else if (aCodecId.EqualsLiteral("V_VP9")) {
++    tag.AssignLiteral("vp9");
++  } else if (aCodecId.EqualsLiteral("V_MPEG4/ISO/AVC")) {
++    tag.AssignLiteral("h264");
++  } else if (aCodecId.EqualsLiteral("A_OPUS")) {
++    tag.AssignLiteral("opus");
++  } else if (aCodecId.EqualsLiteral("A_VORBIS")) {
++    tag.AssignLiteral("vorbis");
++  } else if (aCodecId.EqualsLiteral("A_AAC")) {
++    tag.AssignLiteral("aac");
++  } else if (!aMimeType.IsEmpty()) {
++    tag.AssignLiteral("unsupported-");
++    nsAutoCString sanitized(aMimeType);
++    sanitized.ReplaceChar('/', '-');
++    tag.Append(sanitized);
++  }
++  return tag;
++}
++
+ // libmkv's own writeVideoTrack() (media/libmkv/WebMElement.c) has no way to
+ // write a CodecPrivate element, which VP8/VP9 don't need but H.264 (avcC)
+ // does -- so this writes the video TrackEntry directly via the same
+@@ -126,7 +157,8 @@ void MediaDumpSink::RequestFileHandle(RefPtr<TaskQueue> aOwnerQueue) {
+           PRFileDesc* file = PR_Open(
+               path.get(), PR_WRONLY | PR_CREATE_FILE | PR_TRUNCATE, 0600);
+           if (!file) {
+-            NS_WARNING("MediaDumpMuxer: could not open dump file directly.");
++            fprintf(stderr,
++                    "MediaDumpMuxer: could not open dump file directly.\n");
+           }
+           self->OnFileHandleReady(file);
+         }));
+@@ -161,10 +193,12 @@ void MediaDumpSink::RequestFileHandle(RefPtr<TaskQueue> aOwnerQueue) {
+                     aResult.get_FileDescriptor().ClonePlatformHandle();
+                 file = PR_ImportFile(PROsfd(rawFD.release()));
+               } else {
+-                NS_WARNING(
+-                    "MediaDumpMuxer: parent could not open dump file. Does "
+-                    "the chosen path exist and is it writable?");
++                fprintf(stderr,
++                        "MediaDumpMuxer: parent could not open dump file. "
++                        "Does the chosen path exist and is it writable?\n");
+               }
++              fprintf(stderr, "MediaDumpMuxer: RequestMediaDumpFile %s\n",
++                      file ? "succeeded" : "failed");
+               // Hand off to mOwnerQueue: mFile/mPendingWrites must only
+               // ever be touched from there.
+               nsresult rv = self->mOwnerQueue->Dispatch(NS_NewRunnableFunction(
+@@ -237,23 +271,9 @@ void MediaDumpMuxer::Init(const nsACString& aPathPrefix,
+   nsAutoCString videoCodecId, audioCodecId;
+   if (aVideo) {
+     videoCodecId = MapVideoCodecId(aVideo->mMimeType);
+-    if (videoCodecId.IsEmpty()) {
+-      NS_WARNING(nsPrintfCString(
+-                    "MediaDumpMuxer: unsupported video codec %s, dumping "
+-                    "audio only (if present)",
+-                    aVideo->mMimeType.get())
+-                    .get());
+-    }
+   }
+   if (aAudio) {
+     audioCodecId = MapAudioCodecId(aAudio->mMimeType);
+-    if (audioCodecId.IsEmpty()) {
+-      NS_WARNING(nsPrintfCString(
+-                    "MediaDumpMuxer: unsupported audio codec %s, dumping "
+-                    "video only (if present)",
+-                    aAudio->mMimeType.get())
+-                    .get());
+-    }
+   }
+ 
+   mHasVideo = aVideo && !videoCodecId.IsEmpty();
+@@ -321,15 +341,21 @@ void MediaDumpMuxer::Init(const nsACString& aPathPrefix,
+   // per-process counter starts back at 1 every launch and silently
+   // clobbers the previous session's dump of the same name.
+   static Atomic<uint32_t> sNextDumpId(0);
++  nsAutoCString videoTag(aVideo ? ShortCodecTag(aVideo->mMimeType, videoCodecId)
++                                : nsAutoCString("novideo"));
++  nsAutoCString audioTag(aAudio ? ShortCodecTag(aAudio->mMimeType, audioCodecId)
++                                : nsAutoCString("noaudio"));
+   nsAutoCString path;
+-  path.AppendPrintf("%s-%lld-%u.mkv", PromiseFlatCString(aPathPrefix).get(),
+-                    static_cast<long long>(PR_Now()), ++sNextDumpId);
++  path.AppendPrintf("%s-%s-%s-%lld-%u.mkv",
++                    PromiseFlatCString(aPathPrefix).get(), videoTag.get(),
++                    audioTag.get(), static_cast<long long>(PR_Now()),
++                    ++sNextDumpId);
+   mSink = new MediaDumpSink(std::move(path));
+ 
+   RefPtr<SharedThreadPool> pool =
+       GetMediaThreadPool(MediaThreadType::SUPERVISOR);
+   if (!pool) {
+-    NS_WARNING("MediaDumpMuxer: failed to get thread pool");
++    fprintf(stderr, "MediaDumpMuxer: failed to get thread pool\n");
+     mSink = nullptr;
+     return;
+   }
+-- 
+2.46.0.windows.1
+

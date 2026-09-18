@@ -1,0 +1,50 @@
+From 792f20b2d1ff41a4d164b0b0bec3289ed95f03b1 Mon Sep 17 00:00:00 2001
+From: FNGarvin <184324400+FNGarvin@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 13:02:13 -0500
+Subject: [PATCH 11/12] Add AV1 video codec support to MediaDumpMuxer
+
+Confirmed identified as the missing codec via the new filename tagging
+(both failing test videos landed on "unsupported-video-av1"). Like H.264,
+needed zero bitstream reformatting: AV1's ISOBMFF config record (the av1C
+box, already sitting in VideoInfo::mExtraData via the same DecoderData.cpp
+extraction path used for avcC) is specified to be reused verbatim as
+Matroska's CodecPrivate for V_AV1, and DAV1DDecoder.cpp feeds
+aSample->Data()/Size() straight to dav1d with no transform.
+---
+ dom/media/MediaDumpMuxer.cpp | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/dom/media/MediaDumpMuxer.cpp b/dom/media/MediaDumpMuxer.cpp
+index 8d20be0b1ff8..ee65dfa1aca9 100644
+--- a/dom/media/MediaDumpMuxer.cpp
++++ b/dom/media/MediaDumpMuxer.cpp
+@@ -48,8 +48,16 @@ static nsAutoCString MapVideoCodecId(const nsCString& aMimeType) {
+     // itself (AVCC length-prefixed NALs) needs no reformatting either --
+     // exactly the CodecPrivate/sample format Matroska expects here.
+     id.AssignLiteral("V_MPEG4/ISO/AVC");
++  } else if (aMimeType.EqualsLiteral("video/av1")) {
++    // Unlike H.264, AV1's ISOBMFF config record (the av1C box, which is
++    // what VideoInfo::mExtraData holds here -- same DecoderData.cpp
++    // extraction path as avcC above) is explicitly specified to be reused
++    // verbatim as Matroska's CodecPrivate for V_AV1; see AOMDecoder.h's
++    // av1C reader/writer. Raw sample bytes need no reformatting either --
++    // DAV1DDecoder.cpp feeds aSample->Data()/Size() straight to dav1d.
++    id.AssignLiteral("V_AV1");
+   }
+-  // video/av1, video/hevc, etc. not yet supported.
++  // video/hevc, etc. not yet supported.
+   return id;
+ }
+ 
+@@ -86,6 +94,8 @@ static nsAutoCString ShortCodecTag(const nsCString& aMimeType,
+     tag.AssignLiteral("vp9");
+   } else if (aCodecId.EqualsLiteral("V_MPEG4/ISO/AVC")) {
+     tag.AssignLiteral("h264");
++  } else if (aCodecId.EqualsLiteral("V_AV1")) {
++    tag.AssignLiteral("av1");
+   } else if (aCodecId.EqualsLiteral("A_OPUS")) {
+     tag.AssignLiteral("opus");
+   } else if (aCodecId.EqualsLiteral("A_VORBIS")) {
+-- 
+2.46.0.windows.1
+

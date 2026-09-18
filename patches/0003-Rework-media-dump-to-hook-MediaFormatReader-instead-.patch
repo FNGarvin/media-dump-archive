@@ -1,0 +1,1063 @@
+From 52ea98725b9715200f90cac9ac5b3e514912b352 Mon Sep 17 00:00:00 2001
+From: FNGarvin <184324400+FNGarvin@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 14:25:01 -0500
+Subject: [PATCH 03/12] Rework media dump to hook MediaFormatReader instead of
+ MSE only
+
+Move the capture point from SourceBuffer::AppendData (MSE-only) down to
+MediaFormatReader::OnVideoDemuxCompleted/OnAudioDemuxCompleted, the point
+where every playback pipeline -- MSE, blob-backed, or a plain URL -- has
+already converged before decode. This makes "Dump Media Stream" work
+regardless of how a page is feeding the <video>/<audio> element, not just
+MSE-backed ones.
+
+Demuxed samples are muxed into a single combined Matroska (.mkv) file via
+the new MediaDumpMuxer, which reuses Gecko's existing low-level EBML
+primitives (the same ones WebMWriter uses for MediaRecorder) but, unlike
+that writer, reads each track's actual codec ID and codec-private config
+from its TrackInfo instead of hardcoding VP8+Opus. Currently wired up for
+VP8/VP9 video and Opus/Vorbis audio; H.264+AAC needs further codec-private
+reformatting work and isn't included yet.
+
+Encrypted (EME/DRM) samples are dropped at the sample level rather than
+relying on never attaching to begin with.
+
+Removes the superseded SourceBuffer-specific MseStreamDumper mechanism.
+---
+ browser/actors/ContextMenuChild.sys.mjs     |   6 +-
+ browser/base/content/nsContextMenu.sys.mjs  |  11 +-
+ dom/media/MediaDecoder.cpp                  |  16 ++
+ dom/media/MediaDecoder.h                    |   5 +
+ dom/media/MediaDumpMuxer.cpp                | 236 ++++++++++++++++++++
+ dom/media/MediaDumpMuxer.h                  | 102 +++++++++
+ dom/media/MediaFormatReader.cpp             |  41 ++++
+ dom/media/MediaFormatReader.h               |  12 +
+ dom/media/mediaelement/HTMLMediaElement.cpp |  12 +-
+ dom/media/mediaelement/HTMLMediaElement.h   |   8 +-
+ dom/media/mediasource/MediaSource.cpp       |  28 ---
+ dom/media/mediasource/MediaSource.h         |  13 --
+ dom/media/mediasource/MseStreamDumper.cpp   | 118 ----------
+ dom/media/mediasource/MseStreamDumper.h     |  83 -------
+ dom/media/mediasource/SourceBuffer.cpp      |   4 -
+ dom/media/mediasource/SourceBuffer.h        |  10 -
+ dom/media/mediasource/moz.build             |   2 -
+ dom/media/moz.build                         |   1 +
+ dom/webidl/HTMLMediaElement.webidl          |  11 +-
+ 19 files changed, 436 insertions(+), 283 deletions(-)
+ create mode 100644 dom/media/MediaDumpMuxer.cpp
+ create mode 100644 dom/media/MediaDumpMuxer.h
+ delete mode 100644 dom/media/mediasource/MseStreamDumper.cpp
+ delete mode 100644 dom/media/mediasource/MseStreamDumper.h
+
+diff --git a/browser/actors/ContextMenuChild.sys.mjs b/browser/actors/ContextMenuChild.sys.mjs
+index a9a82f784e50..1c90a324547b 100644
+--- a/browser/actors/ContextMenuChild.sys.mjs
++++ b/browser/actors/ContextMenuChild.sys.mjs
+@@ -120,7 +120,7 @@ export class ContextMenuChild extends JSWindowActorChild {
+                 }
+                 break;
+               case "dumpMediaStream":
+-                media.startMseDump(message.data.data);
++                media.startMediaDump(message.data.data);
+                 break;
+               case "pictureinpicture": {
+                 let event = new this.contentWindow.CustomEvent(
+@@ -1086,8 +1086,6 @@ export class ContextMenuChild extends JSWindowActorChild {
+         context.onDRMMedia = true;
+       }
+ 
+-      context.hasMediaSource = !!context.target.mozMediaSourceObject;
+-
+       if (context.target.isCloningElementVisually) {
+         context.onPiPVideo = true;
+       }
+@@ -1114,8 +1112,6 @@ export class ContextMenuChild extends JSWindowActorChild {
+       if (this._isProprietaryDRM()) {
+         context.onDRMMedia = true;
+       }
+-
+-      context.hasMediaSource = !!context.target.mozMediaSourceObject;
+     } else if (
+       editFlags &
+       (lazy.SpellCheckHelper.INPUT | lazy.SpellCheckHelper.TEXTAREA)
+diff --git a/browser/base/content/nsContextMenu.sys.mjs b/browser/base/content/nsContextMenu.sys.mjs
+index a1980a53e2ce..d74f708a30be 100644
+--- a/browser/base/content/nsContextMenu.sys.mjs
++++ b/browser/base/content/nsContextMenu.sys.mjs
+@@ -254,7 +254,6 @@ export class nsContextMenu {
+     this.onCanvas = context.onCanvas;
+     this.onCompletedImage = context.onCompletedImage;
+     this.onDRMMedia = context.onDRMMedia;
+-    this.hasMediaSource = context.hasMediaSource;
+     this.onPiPVideo = context.onPiPVideo;
+     this.onEditable = context.onEditable;
+     this.onImage = context.onImage;
+@@ -688,14 +687,14 @@ export class nsContextMenu {
+       !this.mediaURL || mediaIsBlob
+     );
+ 
+-    // Only useful for MSE playback (blob: URLs backed by a MediaSource) --
+-    // that's exactly the case regular Save Video/Audio As can't handle, and
+-    // DRM'd content is excluded since we never see decrypted bytes for it.
++    // Works regardless of how the element is being played back (MSE, blob,
++    // or a plain URL) since it captures demuxed samples, not the source --
++    // see MediaDumpMuxer.h. DRM'd content is excluded since we never see
++    // decrypted bytes for it.
+     this.showItem(
+       "context-dumpmediastream",
+-      (this.onVideo || this.onAudio) && this.hasMediaSource
++      (this.onVideo || this.onAudio) && !this.onDRMMedia
+     );
+-    this.setItemAttr("context-dumpmediastream", "disabled", this.onDRMMedia);
+ 
+     if (
+       Services.policies.status === Services.policies.ACTIVE &&
+diff --git a/dom/media/MediaDecoder.cpp b/dom/media/MediaDecoder.cpp
+index ad2ae9674ec8..efc5c2521f53 100644
+--- a/dom/media/MediaDecoder.cpp
++++ b/dom/media/MediaDecoder.cpp
+@@ -1643,6 +1643,22 @@ void MediaDecoder::GetDebugInfo(dom::MediaDecoderDebugInfo& aInfo) {
+       NS_ConvertUTF8toUTF16(ContainerType().Type().AsString());
+ }
+ 
++void MediaDecoder::StartMediaDump(const nsACString& aDirPath) {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (!mReader) {
++    return;
++  }
++  mReader->StartMediaDump(aDirPath);
++}
++
++void MediaDecoder::StopMediaDump() {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (!mReader) {
++    return;
++  }
++  mReader->StopMediaDump();
++}
++
+ RefPtr<GenericPromise> MediaDecoder::RequestDebugInfo(
+     MediaDecoderDebugInfo& aInfo) {
+   MOZ_DIAGNOSTIC_ASSERT(!IsShutdown());
+diff --git a/dom/media/MediaDecoder.h b/dom/media/MediaDecoder.h
+index ae7c0aef711a..44b4da91ce61 100644
+--- a/dom/media/MediaDecoder.h
++++ b/dom/media/MediaDecoder.h
+@@ -474,6 +474,11 @@ class MediaDecoder : public DecoderDoctorLifeLogger<MediaDecoder> {
+ 
+   void GetDebugInfo(dom::MediaDecoderDebugInfo& aInfo);
+ 
++  // See MediaFormatReader::StartMediaDump/StopMediaDump. No-op if this
++  // decoder has no reader (e.g. shut down).
++  void StartMediaDump(const nsACString& aDirPath);
++  void StopMediaDump();
++
+   virtual bool IsHLSDecoder() const { return false; }
+ 
+  protected:
+diff --git a/dom/media/MediaDumpMuxer.cpp b/dom/media/MediaDumpMuxer.cpp
+new file mode 100644
+index 000000000000..deb8ce42ef90
+--- /dev/null
++++ b/dom/media/MediaDumpMuxer.cpp
+@@ -0,0 +1,236 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "MediaDumpMuxer.h"
++
++#include <limits>
++
++#include "MediaData.h"
++#include "MediaInfo.h"
++#include "VideoUtils.h"
++#include "libmkv/EbmlIDs.h"
++#include "libmkv/EbmlWriter.h"
++#include "libmkv/WebMElement.h"
++#include "mozilla/Atomics.h"
++#include "mozilla/UniquePtr.h"
++#include "nsThreadUtils.h"
++
++#ifdef XP_WIN
++#  include "nsString.h"
++#endif
++
++namespace mozilla {
++
++// Timecode scale in nanoseconds -- SimpleBlock timecodes below are in
++// milliseconds, matching TIME_CODE_SCALE = 1e6ns = 1ms.
++constexpr unsigned long kTimeCodeScale = 1000000;
++constexpr int32_t kHeaderBudget = 4096;
++constexpr int64_t kMaxBlockTimecodeMs = std::numeric_limits<int16_t>::max();
++constexpr int64_t kNewClusterAfterMs = 1000;
++static_assert(kNewClusterAfterMs <= kMaxBlockTimecodeMs);
++
++// Returns "" if aMimeType isn't a codec this muxer knows how to write.
++static nsAutoCString MapVideoCodecId(const nsCString& aMimeType) {
++  nsAutoCString id;
++  if (aMimeType.EqualsLiteral("video/vp8")) {
++    id.AssignLiteral("V_VP8");
++  } else if (aMimeType.EqualsLiteral("video/vp9")) {
++    id.AssignLiteral("V_VP9");
++  }
++  // video/avc (H.264), video/av1, etc. intentionally not yet supported --
++  // H.264 and AAC need extra codec-private reformatting (avcC / bare
++  // AudioSpecificConfig extraction) not yet implemented here.
++  return id;
++}
++
++static nsAutoCString MapAudioCodecId(const nsCString& aMimeType) {
++  nsAutoCString id;
++  if (aMimeType.EqualsLiteral("audio/opus")) {
++    id.AssignLiteral("A_OPUS");
++  } else if (aMimeType.EqualsLiteral("audio/vorbis")) {
++    id.AssignLiteral("A_VORBIS");
++  }
++  return id;
++}
++
++void MediaDumpSink::Write(const nsTArray<uint8_t>& aBytes) {
++  if (!mFile && !mOpenAttempted) {
++    mOpenAttempted = true;
++#ifdef XP_WIN
++    nsAutoString widePath = NS_ConvertUTF8toUTF16(mPath);
++    mFile = _wfopen(widePath.get(), L"wb");
++#else
++    mFile = fopen(mPath.get(), "wb");
++#endif
++    if (!mFile) {
++      NS_WARNING(
++          "MediaDumpMuxer: could not open dump file. Is the content "
++          "sandbox disabled (MOZ_DISABLE_CONTENT_SANDBOX=1)?");
++    }
++  }
++  if (!mFile) {
++    return;
++  }
++  (void)fwrite(aBytes.Elements(), 1, aBytes.Length(), mFile);
++  fflush(mFile);
++}
++
++MediaDumpSink::~MediaDumpSink() {
++  if (mFile) {
++    fclose(mFile);
++  }
++}
++
++void MediaDumpMuxer::DispatchWrite(nsTArray<uint8_t>&& aBytes) {
++  if (!mSink) {
++    return;
++  }
++  RefPtr<MediaDumpSink> sink = mSink;
++  nsresult rv = mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "MediaDumpMuxer::DispatchWrite",
++      [sink, bytes = std::move(aBytes)]() { sink->Write(bytes); }));
++  NS_ENSURE_SUCCESS_VOID(rv);
++}
++
++void MediaDumpMuxer::Init(const nsACString& aDirPath, const VideoInfo* aVideo,
++                          const AudioInfo* aAudio) {
++  MOZ_ASSERT(!mInitialized);
++  mInitialized = true;
++
++  nsAutoCString videoCodecId, audioCodecId;
++  if (aVideo) {
++    videoCodecId = MapVideoCodecId(aVideo->mMimeType);
++  }
++  if (aAudio) {
++    audioCodecId = MapAudioCodecId(aAudio->mMimeType);
++  }
++
++  mHasVideo = aVideo && !videoCodecId.IsEmpty();
++  mHasAudio = aAudio && !audioCodecId.IsEmpty();
++  if (!mHasVideo && !mHasAudio) {
++    return;  // Nothing this muxer can write; stay disarmed.
++  }
++
++  mVideoTrackNumber = mHasVideo ? 1 : 0;
++  mAudioTrackNumber = mHasVideo ? 2 : 1;
++
++  RefPtr<MediaByteBuffer> audioPrivate;
++  if (mHasAudio) {
++    audioPrivate = ForceGetAudioCodecSpecificBlob(aAudio->mCodecSpecificConfig);
++  }
++
++  auto bufSize = size_t(kHeaderBudget) +
++                 (audioPrivate ? audioPrivate->Length() : 0);
++  auto buffer = MakeUnique<uint8_t[]>(bufSize);
++  EbmlGlobal ebml;
++  ebml.buf = buffer.get();
++  ebml.offset = 0;
++
++  writeHeader(&ebml);
++  {
++    EbmlLoc segEbmlLoc, seekEbmlLoc, infoEbmlLoc;
++    Ebml_StartSubElement(&ebml, &segEbmlLoc, Segment);
++    Ebml_StartSubElement(&ebml, &seekEbmlLoc, SeekHead);
++    // As in EbmlComposer: exact sizes aren't known ahead of time, so this
++    // section is intentionally left empty.
++    Ebml_EndSubElement(&ebml, &seekEbmlLoc);
++    writeSegmentInformation(&ebml, &infoEbmlLoc, kTimeCodeScale, 0);
++    {
++      EbmlLoc trackLoc;
++      Ebml_StartSubElement(&ebml, &trackLoc, Tracks);
++      if (mHasVideo) {
++        writeVideoTrack(&ebml, mVideoTrackNumber, 0, videoCodecId.get(),
++                        aVideo->mImage.width, aVideo->mImage.height,
++                        aVideo->mDisplay.width, aVideo->mDisplay.height);
++      }
++      if (mHasAudio) {
++        writeAudioTrack(&ebml, mAudioTrackNumber, 0, audioCodecId.get(),
++                        aAudio->mRate, aAudio->mChannels,
++                        /* codecDelay */ 0, /* seekPreRoll */ 0,
++                        audioPrivate ? audioPrivate->Elements() : nullptr,
++                        audioPrivate ? audioPrivate->Length() : 0);
++      }
++      Ebml_EndSubElement(&ebml, &trackLoc);
++    }
++    // The Segment's size is left unknown, same as EbmlComposer -- this file
++    // is written incrementally and its final size isn't known up front.
++  }
++  MOZ_ASSERT(ebml.offset <= bufSize);
++
++  nsTArray<uint8_t> header;
++  header.AppendElements(buffer.get(), ebml.offset);
++
++  static Atomic<uint32_t> sNextDumpId(0);
++  nsAutoCString path;
++  path.AppendPrintf("%s/mediadump-%u.mkv",
++                    PromiseFlatCString(aDirPath).get(), ++sNextDumpId);
++  mSink = new MediaDumpSink(std::move(path));
++
++  RefPtr<SharedThreadPool> pool =
++      GetMediaThreadPool(MediaThreadType::SUPERVISOR);
++  if (!pool) {
++    NS_WARNING("MediaDumpMuxer: failed to get thread pool");
++    mSink = nullptr;
++    return;
++  }
++  mTaskQueue = TaskQueue::Create(pool.forget(), "MediaDumpMuxer");
++
++  DispatchWrite(std::move(header));
++}
++
++void MediaDumpMuxer::WriteSample(bool aIsVideo, MediaRawData* aSample) {
++  if (!mSink) {
++    return;
++  }
++  if ((aIsVideo && !mHasVideo) || (!aIsVideo && !mHasAudio)) {
++    return;
++  }
++  if (aSample->mCrypto.IsEncrypted()) {
++    // EME/DRM content: never surface decrypted bytes here, so just drop it.
++    return;
++  }
++
++  const bool isVideoKeyframe = aIsVideo && aSample->mKeyframe;
++  if (aIsVideo && !aSample->mKeyframe && !mHasWrittenCluster) {
++    // Never start the file on a non-keyframe video sample.
++    return;
++  }
++
++  const int64_t sampleTimeMs = aSample->mTime.ToMilliseconds();
++  int64_t timeCodeMs = sampleTimeMs - mCurrentClusterTimecodeMs;
++  const bool needClusterHeader =
++      !mHasWrittenCluster || timeCodeMs >= kNewClusterAfterMs ||
++      isVideoKeyframe;
++
++  auto block = MakeUnique<uint8_t[]>(size_t(kHeaderBudget) + aSample->Size());
++  EbmlGlobal ebml;
++  ebml.buf = block.get();
++  ebml.offset = 0;
++
++  if (needClusterHeader) {
++    mHasWrittenCluster = true;
++    EbmlLoc clusterLoc;
++    // As in EbmlComposer: never explicitly ended, so the muxer doesn't need
++    // to buffer a whole cluster in memory to know its final size -- the
++    // next cluster's start implicitly ends this one.
++    Ebml_StartSubElement(&ebml, &clusterLoc, Cluster);
++    mCurrentClusterTimecodeMs = sampleTimeMs;
++    Ebml_SerializeUnsigned(&ebml, Timecode, mCurrentClusterTimecodeMs);
++    timeCodeMs = 0;
++  }
++
++  MOZ_ASSERT(timeCodeMs >= 0 && timeCodeMs < kNewClusterAfterMs);
++
++  writeSimpleBlock(&ebml, aIsVideo ? mVideoTrackNumber : mAudioTrackNumber,
++                   static_cast<int16_t>(timeCodeMs), isVideoKeyframe,
++                   /* lacingFlag */ 0, /* discardable */ 0,
++                   const_cast<unsigned char*>(aSample->Data()),
++                   aSample->Size());
++
++  nsTArray<uint8_t> bytes;
++  bytes.AppendElements(block.get(), ebml.offset);
++  DispatchWrite(std::move(bytes));
++}
++
++}  // namespace mozilla
+diff --git a/dom/media/MediaDumpMuxer.h b/dom/media/MediaDumpMuxer.h
+new file mode 100644
+index 000000000000..8ca62c3d1d1c
+--- /dev/null
++++ b/dom/media/MediaDumpMuxer.h
+@@ -0,0 +1,102 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_MediaDumpMuxer_h_
++#define mozilla_MediaDumpMuxer_h_
++
++#include <stdio.h>
++
++#include "mozilla/RefPtr.h"
++#include "mozilla/TaskQueue.h"
++#include "nsISupportsImpl.h"
++#include "nsString.h"
++#include "nsTArray.h"
++
++namespace mozilla {
++
++class MediaRawData;
++class VideoInfo;
++class AudioInfo;
++
++// Owns the on-disk file a MediaDumpMuxer writes to. Lives only on the
++// muxer's TaskQueue; a RefPtr to it is captured by every dispatched write
++// task instead of a raw pointer, so it stays alive exactly as long as there
++// is queued work left, even if the owning MediaFormatReader is destroyed
++// first (see MseDumpSink in the mediasource/ directory for the same idiom).
++class MediaDumpSink final {
++ public:
++  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaDumpSink)
++
++  explicit MediaDumpSink(nsCString&& aPath) : mPath(std::move(aPath)) {}
++
++  // Must be called on the owning MediaDumpMuxer's TaskQueue.
++  void Write(const nsTArray<uint8_t>& aBytes);
++
++ private:
++  ~MediaDumpSink();
++
++  nsCString mPath;
++  FILE* mFile = nullptr;
++  bool mOpenAttempted = false;
++};
++
++// Muxes demuxed (compressed, pre-decode) audio/video samples into a single
++// Matroska (.mkv) file, regardless of which pipeline produced them -- MSE,
++// a blob: URL, or a plain network URL all end up here, since every one of
++// them flows through MediaFormatReader before decode.
++//
++// Reuses the codec-agnostic low-level EBML primitives in media/libmkv (the
++// same ones WebMWriter/EbmlComposer use for MediaRecorder output), but --
++// unlike EbmlComposer, which hardcodes VP8 video + Opus audio -- takes each
++// track's actual codec ID and codec-private config from its TrackInfo, so
++// it isn't tied to one codec pair. Currently wired up for VP8/VP9 video and
++// Opus/Vorbis audio; unsupported codecs are simply not written (see
++// MapVideoCodecId/MapAudioCodecId in the .cpp).
++//
++// Must only be used from one thread/TaskQueue at a time (the owning
++// MediaFormatReader's), except construction.
++class MediaDumpMuxer final {
++ public:
++  MediaDumpMuxer() = default;
++  ~MediaDumpMuxer() = default;
++
++  // Must be called once, after the final track set for this element is
++  // known (MediaFormatReader knows this from metadata, before any sample is
++  // demuxed) but before any WriteSample call. aVideo/aAudio may be null if
++  // that track doesn't exist. No-op (dump stays permanently disarmed) if
++  // neither track's codec is supported.
++  void Init(const nsACString& aDirPath, const VideoInfo* aVideo,
++            const AudioInfo* aAudio);
++
++  // Feed one demuxed sample for the given track. No-op if Init() wasn't
++  // able to arm that track (unsupported codec) or if the sample is
++  // encrypted (EME/DRM samples are silently dropped, never written).
++  void WriteSample(bool aIsVideo, MediaRawData* aSample);
++
++ private:
++  void WriteHeader(const nsACString& aDirPath, const VideoInfo* aVideo,
++                   const AudioInfo* aAudio);
++  void DispatchWrite(nsTArray<uint8_t>&& aBytes);
++
++  bool mInitialized = false;
++  bool mHasVideo = false;
++  bool mHasAudio = false;
++  uint8_t mVideoTrackNumber = 0;
++  uint8_t mAudioTrackNumber = 0;
++
++  // True once the first Cluster header has been written. Matches
++  // EbmlComposer's approach: clusters are never explicitly closed (that
++  // would require buffering a whole cluster to know its size up front);
++  // the next cluster's start implicitly ends the previous one, which lets
++  // this stream to disk incrementally.
++  bool mHasWrittenCluster = false;
++  int64_t mCurrentClusterTimecodeMs = 0;
++
++  RefPtr<TaskQueue> mTaskQueue;
++  RefPtr<MediaDumpSink> mSink;
++};
++
++}  // namespace mozilla
++
++#endif  // mozilla_MediaDumpMuxer_h_
+diff --git a/dom/media/MediaFormatReader.cpp b/dom/media/MediaFormatReader.cpp
+index 6017aec9ea99..188c8ede71b8 100644
+--- a/dom/media/MediaFormatReader.cpp
++++ b/dom/media/MediaFormatReader.cpp
+@@ -11,6 +11,7 @@
+ #include "MP4Decoder.h"
+ #include "MediaData.h"
+ #include "MediaDataDecoderProxy.h"
++#include "MediaDumpMuxer.h"
+ #include "MediaGleanMetrics.h"
+ #include "MediaInfo.h"
+ #include "PDMFactory.h"
+@@ -1632,6 +1633,11 @@ void MediaFormatReader::OnVideoDemuxCompleted(
+   mVideo.mDemuxRequest.Complete();
+   MOZ_ASSERT(mVideo.mQueuedSamples.IsEmpty());
+   mVideo.mQueuedSamples = aSamples->GetMovableSamples();
++  if (mDumpMuxer) {
++    for (const auto& sample : mVideo.mQueuedSamples) {
++      mDumpMuxer->WriteSample(/* aIsVideo */ true, sample);
++    }
++  }
+   for (const auto& sample : mVideo.mQueuedSamples) {
+     mVideo.mFrameRateEstimator.Observe(*sample);
+   }
+@@ -1729,6 +1735,11 @@ void MediaFormatReader::OnAudioDemuxCompleted(
+   mAudio.mDemuxRequest.Complete();
+   MOZ_ASSERT(mAudio.mQueuedSamples.IsEmpty());
+   mAudio.mQueuedSamples = aSamples->GetMovableSamples();
++  if (mDumpMuxer) {
++    for (const auto& sample : mAudio.mQueuedSamples) {
++      mDumpMuxer->WriteSample(/* aIsVideo */ false, sample);
++    }
++  }
+   ScheduleUpdate(TrackInfo::kAudioTrack);
+ }
+ 
+@@ -3447,6 +3458,36 @@ RefPtr<GenericPromise> MediaFormatReader::RequestDebugInfo(
+   return GenericPromise::CreateAndResolve(true, __func__);
+ }
+ 
++void MediaFormatReader::StartMediaDump(const nsACString& aDirPath) {
++  MOZ_ASSERT(NS_IsMainThread());
++  nsCString dirPath(aDirPath);
++  nsresult rv = mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "MediaFormatReader::StartMediaDump",
++      [self = RefPtr{this}, dirPath]() {
++        if (self->mDumpMuxer || self->mMediaDumpStopped) {
++          return;  // Already armed, or explicitly stopped: first call wins.
++        }
++        self->mDumpMuxer = MakeUnique<MediaDumpMuxer>();
++        self->mDumpMuxer->Init(dirPath,
++                               self->HasVideo() ? &self->mInfo.mVideo
++                                                 : nullptr,
++                               self->HasAudio() ? &self->mInfo.mAudio
++                                                 : nullptr);
++      }));
++  NS_ENSURE_SUCCESS_VOID(rv);
++}
++
++void MediaFormatReader::StopMediaDump() {
++  MOZ_ASSERT(NS_IsMainThread());
++  nsresult rv = mTaskQueue->Dispatch(
++      NS_NewRunnableFunction("MediaFormatReader::StopMediaDump",
++                             [self = RefPtr{this}]() {
++                               self->mMediaDumpStopped = true;
++                               self->mDumpMuxer = nullptr;
++                             }));
++  NS_ENSURE_SUCCESS_VOID(rv);
++}
++
+ void MediaFormatReader::GetDebugInfo(dom::MediaFormatReaderDebugInfo& aInfo) {
+   MOZ_ASSERT(OnTaskQueue(),
+              "Don't call this off the task queue, it's going to touch a lot of "
+diff --git a/dom/media/MediaFormatReader.h b/dom/media/MediaFormatReader.h
+index 38c1ee99db6b..c2da52b43351 100644
+--- a/dom/media/MediaFormatReader.h
++++ b/dom/media/MediaFormatReader.h
+@@ -28,6 +28,7 @@ namespace mozilla {
+ 
+ class CDMProxy;
+ class GMPCrashHelper;
++class MediaDumpMuxer;
+ class MediaResource;
+ class VideoFrameContainer;
+ 
+@@ -200,6 +201,13 @@ class MediaFormatReader final
+   RefPtr<GenericPromise> RequestDebugInfo(
+       dom::MediaFormatReaderDebugInfo& aInfo);
+ 
++  // Dumps every demuxed (compressed, pre-decode) sample to a file under
++  // aDirPath, regardless of what fed this reader's demuxer (MSE, blob, or
++  // plain URL). See MediaDumpMuxer.h. Must be called on the main thread;
++  // internally hops to OwnerThread(), matching RequestDebugInfo() above.
++  void StartMediaDump(const nsACString& aDirPath);
++  void StopMediaDump();
++
+   // Switch the video decoder to NullDecoderModule. It might takes effective
+   // since a few samples later depends on how much demuxed samples are already
+   // queued in the original video decoder.
+@@ -899,6 +907,10 @@ class MediaFormatReader final
+   // Stores presentation info required for playback.
+   MediaInfo mInfo;
+ 
++  // See StartMediaDump/StopMediaDump. Only touched on OwnerThread().
++  UniquePtr<MediaDumpMuxer> mDumpMuxer;
++  bool mMediaDumpStopped = false;
++
+   UniquePtr<MetadataTags> mTags;
+ 
+   // A flag indicating if the start time is known or not.
+diff --git a/dom/media/mediaelement/HTMLMediaElement.cpp b/dom/media/mediaelement/HTMLMediaElement.cpp
+index 1c7c76ac458e..f409c887ff74 100644
+--- a/dom/media/mediaelement/HTMLMediaElement.cpp
++++ b/dom/media/mediaelement/HTMLMediaElement.cpp
+@@ -2373,18 +2373,18 @@ already_AddRefed<MediaSource> HTMLMediaElement::GetMozMediaSourceObject()
+   return source.forget();
+ }
+ 
+-void HTMLMediaElement::StartMseDump(const nsAString& aDirPath) {
+-  if (!mMediaSource) {
++void HTMLMediaElement::StartMediaDump(const nsAString& aDirPath) {
++  if (!mDecoder) {
+     return;
+   }
+-  mMediaSource->StartMseDump(NS_ConvertUTF16toUTF8(aDirPath));
++  mDecoder->StartMediaDump(NS_ConvertUTF16toUTF8(aDirPath));
+ }
+ 
+-void HTMLMediaElement::StopMseDump() {
+-  if (!mMediaSource) {
++void HTMLMediaElement::StopMediaDump() {
++  if (!mDecoder) {
+     return;
+   }
+-  mMediaSource->StopMseDump();
++  mDecoder->StopMediaDump();
+ }
+ 
+ already_AddRefed<Promise> HTMLMediaElement::MozRequestDebugInfo(
+diff --git a/dom/media/mediaelement/HTMLMediaElement.h b/dom/media/mediaelement/HTMLMediaElement.h
+index dcd0b4a516b4..3a6365d15aa3 100644
+--- a/dom/media/mediaelement/HTMLMediaElement.h
++++ b/dom/media/mediaelement/HTMLMediaElement.h
+@@ -690,9 +690,11 @@ class HTMLMediaElement : public nsGenericHTMLElement,
+ 
+   already_AddRefed<MediaSource> GetMozMediaSourceObject() const;
+ 
+-  // See HTMLMediaElement.webidl.
+-  void StartMseDump(const nsAString& aDirPath);
+-  void StopMseDump();
++  // See HTMLMediaElement.webidl. Dumps this element's demuxed (compressed,
++  // pre-decode) media samples to disk, one file per element, regardless of
++  // whether playback is MSE-, blob-, or URL-backed -- see MediaDumpMuxer.h.
++  void StartMediaDump(const nsAString& aDirPath);
++  void StopMediaDump();
+ 
+   // Returns a promise which will be resolved after collecting debugging
+   // data from decoder/reader/MDSM. Used for debugging purposes.
+diff --git a/dom/media/mediasource/MediaSource.cpp b/dom/media/mediasource/MediaSource.cpp
+index a069775c87c5..172ee9e0e7cc 100644
+--- a/dom/media/mediasource/MediaSource.cpp
++++ b/dom/media/mediasource/MediaSource.cpp
+@@ -300,40 +300,12 @@ already_AddRefed<SourceBuffer> MediaSource::AddSourceBuffer(
+     return nullptr;
+   }
+   RefPtr<SourceBuffer> sourceBuffer = new SourceBuffer(this, *containerType);
+-  if (mMseDumpArmed) {
+-    sourceBuffer->ArmStreamDump(mMseDumpDir);
+-  }
+   mSourceBuffers->Append(sourceBuffer);
+   DDLINKCHILD("sourcebuffer[]", sourceBuffer.get());
+   MSE_DEBUG("sourceBuffer={}", fmt::ptr(sourceBuffer.get()));
+   return sourceBuffer.forget();
+ }
+ 
+-void MediaSource::StartMseDump(const nsACString& aDirPath) {
+-  MOZ_ASSERT(NS_IsMainThread());
+-  mMseDumpArmed = true;
+-  mMseDumpDir = aDirPath;
+-  for (uint32_t i = 0; i < mSourceBuffers->Length(); ++i) {
+-    bool found = false;
+-    SourceBuffer* sourceBuffer = mSourceBuffers->IndexedGetter(i, found);
+-    if (found && sourceBuffer) {
+-      sourceBuffer->ArmStreamDump(mMseDumpDir);
+-    }
+-  }
+-}
+-
+-void MediaSource::StopMseDump() {
+-  MOZ_ASSERT(NS_IsMainThread());
+-  mMseDumpArmed = false;
+-  for (uint32_t i = 0; i < mSourceBuffers->Length(); ++i) {
+-    bool found = false;
+-    SourceBuffer* sourceBuffer = mSourceBuffers->IndexedGetter(i, found);
+-    if (found && sourceBuffer) {
+-      sourceBuffer->StopStreamDump();
+-    }
+-  }
+-}
+-
+ RefPtr<MediaSource::ActiveCompletionPromise> MediaSource::SourceBufferIsActive(
+     SourceBuffer* aSourceBuffer) {
+   MOZ_ASSERT(NS_IsMainThread());
+diff --git a/dom/media/mediasource/MediaSource.h b/dom/media/mediasource/MediaSource.h
+index 43e0dd9c60a4..577a5da97779 100644
+--- a/dom/media/mediasource/MediaSource.h
++++ b/dom/media/mediasource/MediaSource.h
+@@ -121,15 +121,6 @@ class MediaSource final : public DOMEventTargetHelper,
+   // Resolve all CompletionPromise pending.
+   void CompletePendingTransactions();
+ 
+-  // Chrome-only: dump every attached (and subsequently added) SourceBuffer's
+-  // raw appended bytes to a file under aDirPath. See MseStreamDumper.h and
+-  // HTMLMediaElement::StartMseDump.
+-  void StartMseDump(const nsACString& aDirPath);
+-  // Stops future SourceBuffers from being auto-armed and stops all
+-  // currently-armed ones from accepting further appends. Data already
+-  // written to disk is left in place (see MseStreamDumper::Stop).
+-  void StopMseDump();
+-
+  private:
+   // SourceBuffer uses SetDuration and SourceBufferIsActive
+   friend class mozilla::dom::SourceBuffer;
+@@ -173,10 +164,6 @@ class MediaSource final : public DOMEventTargetHelper,
+ 
+   Maybe<media::TimeRanges> mLiveSeekableRange;
+   nsTArray<MozPromiseHolder<ActiveCompletionPromise>> mCompletionPromises;
+-
+-  // See StartMseDump/StopMseDump.
+-  bool mMseDumpArmed = false;
+-  nsCString mMseDumpDir;
+ };
+ 
+ }  // namespace dom
+diff --git a/dom/media/mediasource/MseStreamDumper.cpp b/dom/media/mediasource/MseStreamDumper.cpp
+deleted file mode 100644
+index 651cbcda4901..000000000000
+--- a/dom/media/mediasource/MseStreamDumper.cpp
++++ /dev/null
+@@ -1,118 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#include "MseStreamDumper.h"
+-
+-#include <stdio.h>
+-
+-#include "MediaData.h"
+-#include "VideoUtils.h"
+-#include "mozilla/Atomics.h"
+-#include "nsThreadUtils.h"
+-
+-#ifdef XP_WIN
+-#  include "nsString.h"
+-#endif
+-
+-namespace mozilla {
+-namespace dom {
+-
+-void MseDumpSink::Write(const RefPtr<MediaByteBuffer>& aData) {
+-  if (!mFile && !mOpenAttempted) {
+-    mOpenAttempted = true;
+-#ifdef XP_WIN
+-    nsAutoString widePath = NS_ConvertUTF8toUTF16(mPath);
+-    mFile = _wfopen(widePath.get(), L"wb");
+-#else
+-    mFile = fopen(mPath.get(), "wb");
+-#endif
+-    if (!mFile) {
+-      NS_WARNING(
+-          "MseStreamDumper: could not open dump file. Is the content "
+-          "sandbox disabled (MOZ_DISABLE_CONTENT_SANDBOX=1)?");
+-    }
+-  }
+-  if (!mFile) {
+-    return;
+-  }
+-  (void)fwrite(aData->Elements(), 1, aData->Length(), mFile);
+-  fflush(mFile);
+-}
+-
+-MseDumpSink::~MseDumpSink() {
+-  if (mFile) {
+-    fclose(mFile);
+-  }
+-}
+-
+-/* static */
+-bool MseStreamDumper::GetDumpDirFromEnv(nsACString& aDir) {
+-  const char* dir = getenv("MOZ_MSE_DUMP_DIR");
+-  if (!dir || !dir[0]) {
+-    return false;
+-  }
+-  aDir.Assign(dir);
+-  return true;
+-}
+-
+-void MseStreamDumper::InitWithDir(const nsACString& aDir) {
+-  MOZ_ASSERT(NS_IsMainThread());
+-  MOZ_ASSERT(!mInitialized);
+-  mInitialized = true;
+-
+-  static Atomic<uint32_t> sNextDumpId(0);
+-  nsAutoCString path;
+-  path.AppendPrintf("%s/msedump-%u.mp4", PromiseFlatCString(aDir).get(),
+-                    ++sNextDumpId);
+-
+-  mSink = new MseDumpSink(std::move(path));
+-
+-  RefPtr<SharedThreadPool> pool =
+-      GetMediaThreadPool(MediaThreadType::SUPERVISOR);
+-  if (!pool) {
+-    NS_WARNING("MseStreamDumper: failed to get thread pool");
+-    mSink = nullptr;
+-    return;
+-  }
+-  mTaskQueue = TaskQueue::Create(pool.forget(), "MseStreamDumper");
+-}
+-
+-void MseStreamDumper::Arm(const nsACString& aDirPath) {
+-  MOZ_ASSERT(NS_IsMainThread());
+-  if (mInitialized) {
+-    return;  // Already armed (env var or a prior Arm() call); first wins.
+-  }
+-  InitWithDir(aDirPath);
+-}
+-
+-void MseStreamDumper::AppendAsync(const RefPtr<MediaByteBuffer>& aData) {
+-  MOZ_ASSERT(NS_IsMainThread());
+-
+-  if (mStopped) {
+-    return;
+-  }
+-
+-  if (!mInitialized) {
+-    nsAutoCString dir;
+-    if (!GetDumpDirFromEnv(dir)) {
+-      mInitialized = true;
+-      return;  // Feature disabled; mSink stays null, every call is a no-op.
+-    }
+-    InitWithDir(dir);
+-  }
+-
+-  if (!mSink) {
+-    return;
+-  }
+-
+-  RefPtr<MseDumpSink> sink = mSink;
+-  RefPtr<MediaByteBuffer> data = aData;
+-  nsresult rv = mTaskQueue->Dispatch(NS_NewRunnableFunction(
+-      "MseStreamDumper::AppendAsync",
+-      [sink, data]() { sink->Write(data); }));
+-  NS_ENSURE_SUCCESS_VOID(rv);
+-}
+-
+-}  // namespace dom
+-}  // namespace mozilla
+diff --git a/dom/media/mediasource/MseStreamDumper.h b/dom/media/mediasource/MseStreamDumper.h
+deleted file mode 100644
+index 1e56c9055f79..000000000000
+--- a/dom/media/mediasource/MseStreamDumper.h
++++ /dev/null
+@@ -1,83 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-#ifndef mozilla_dom_MseStreamDumper_h_
+-#define mozilla_dom_MseStreamDumper_h_
+-
+-#include "mozilla/RefPtr.h"
+-#include "mozilla/TaskQueue.h"
+-#include "nsISupportsImpl.h"
+-#include "nsString.h"
+-
+-namespace mozilla {
+-
+-class MediaByteBuffer;
+-
+-namespace dom {
+-
+-// Owns the on-disk file a single SourceBuffer's appended bytes are written
+-// to. Lives only on the MseStreamDumper's TaskQueue after construction; a
+-// RefPtr to it is captured by every dispatched write task instead of a raw
+-// SourceBuffer/MseStreamDumper pointer, so it stays alive exactly as long as
+-// there is queued work left, even if the owning SourceBuffer is destroyed
+-// first.
+-class MseDumpSink final {
+- public:
+-  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MseDumpSink)
+-
+-  explicit MseDumpSink(nsCString&& aPath) : mPath(std::move(aPath)) {}
+-
+-  // Must be called on the owning MseStreamDumper's TaskQueue.
+-  void Write(const RefPtr<MediaByteBuffer>& aData);
+-
+- private:
+-  ~MseDumpSink();
+-
+-  nsCString mPath;
+-  FILE* mFile = nullptr;
+-  bool mOpenAttempted = false;
+-};
+-
+-// Dumps every byte buffer appended to one SourceBuffer, in order, to its own
+-// file on disk -- a faithful, directly remuxable copy of what the page's JS
+-// player handed to MSE, captured before Gecko does any of its own demuxing.
+-//
+-// Enabled by setting MOZ_MSE_DUMP_DIR to a directory. As with WavDumper's
+-// MOZ_DUMP_AUDIO, the content-process sandbox needs to be disabled
+-// (MOZ_DISABLE_CONTENT_SANDBOX=1) for the file open to succeed.
+-//
+-// AppendAsync must be called on the main thread; the actual file I/O runs on
+-// a dedicated background TaskQueue so SourceBuffer::AppendData never blocks
+-// on disk.
+-class MseStreamDumper final {
+- public:
+-  MseStreamDumper() = default;
+-  ~MseStreamDumper() = default;
+-
+-  // Explicitly arm dumping to aDirPath, e.g. from a chrome-triggered
+-  // context-menu action (see HTMLMediaElement::StartMseDump). Idempotent;
+-  // takes priority over the MOZ_MSE_DUMP_DIR env var.
+-  void Arm(const nsACString& aDirPath);
+-
+-  // Stops accepting further appends. Bytes already written stay on disk and
+-  // remain playable (fMP4 fragments are valid as a prefix); this does not
+-  // retroactively remove them or close the file early.
+-  void Stop() { mStopped = true; }
+-
+-  void AppendAsync(const RefPtr<MediaByteBuffer>& aData);
+-
+- private:
+-  static bool GetDumpDirFromEnv(nsACString& aDir);
+-  void InitWithDir(const nsACString& aDir);
+-
+-  bool mInitialized = false;
+-  bool mStopped = false;
+-  RefPtr<TaskQueue> mTaskQueue;
+-  RefPtr<MseDumpSink> mSink;
+-};
+-
+-}  // namespace dom
+-}  // namespace mozilla
+-
+-#endif  // mozilla_dom_MseStreamDumper_h_
+diff --git a/dom/media/mediasource/SourceBuffer.cpp b/dom/media/mediasource/SourceBuffer.cpp
+index fa967e154ea4..a77dd302eba5 100644
+--- a/dom/media/mediasource/SourceBuffer.cpp
++++ b/dom/media/mediasource/SourceBuffer.cpp
+@@ -571,10 +571,6 @@ void SourceBuffer::AppendData(RefPtr<MediaByteBuffer>&& aData,
+   MOZ_ASSERT(NS_IsMainThread());
+   MSE_DEBUG("AppendData(aLength={})", aData->Length());
+ 
+-  // Capture a copy of the RefPtr (cheap addref) before it's forget()'d below
+-  // -- see MseStreamDumper.h. No-op unless MOZ_MSE_DUMP_DIR is set.
+-  mStreamDumper.AppendAsync(aData);
+-
+   StartUpdating();
+ 
+   mTrackBuffersManager->AppendData(aData.forget(), mCurrentAttributes)
+diff --git a/dom/media/mediasource/SourceBuffer.h b/dom/media/mediasource/SourceBuffer.h
+index 45e02205e2ee..12b6b3262fe5 100644
+--- a/dom/media/mediasource/SourceBuffer.h
++++ b/dom/media/mediasource/SourceBuffer.h
+@@ -7,7 +7,6 @@
+ 
+ #include "MediaContainerType.h"
+ #include "MediaSource.h"
+-#include "MseStreamDumper.h"
+ #include "SourceBufferTask.h"
+ #include "TrackBuffersManager.h"
+ #include "js/RootingAPI.h"
+@@ -126,12 +125,6 @@ class SourceBuffer final : public DOMEventTargetHelper,
+ 
+   bool IsActive() const { return mActive; }
+ 
+-  // See MseStreamDumper.h / MediaSource::StartMseDump.
+-  void ArmStreamDump(const nsACString& aDirPath) {
+-    mStreamDumper.Arm(aDirPath);
+-  }
+-  void StopStreamDump() { mStreamDumper.Stop(); }
+-
+  private:
+   ~SourceBuffer();
+ 
+@@ -182,9 +175,6 @@ class SourceBuffer final : public DOMEventTargetHelper,
+   RefPtr<MediaSource> mMediaSource;
+   const RefPtr<AbstractThread> mAbstractMainThread;
+ 
+-  // See MseStreamDumper.h. No-op unless MOZ_MSE_DUMP_DIR is set.
+-  MseStreamDumper mStreamDumper;
+-
+   RefPtr<TrackBuffersManager> mTrackBuffersManager;
+   SourceBufferAttributes mCurrentAttributes;
+ 
+diff --git a/dom/media/mediasource/moz.build b/dom/media/mediasource/moz.build
+index 195e76a0a3b8..60574eb5ebca 100644
+--- a/dom/media/mediasource/moz.build
++++ b/dom/media/mediasource/moz.build
+@@ -18,7 +18,6 @@ EXPORTS += [
+ 
+ EXPORTS.mozilla.dom += [
+     "MediaSource.h",
+-    "MseStreamDumper.h",
+     "SourceBuffer.h",
+     "SourceBufferList.h",
+ ]
+@@ -29,7 +28,6 @@ UNIFIED_SOURCES += [
+     "MediaSourceDecoder.cpp",
+     "MediaSourceDemuxer.cpp",
+     "MediaSourceUtils.cpp",
+-    "MseStreamDumper.cpp",
+     "ResourceQueue.cpp",
+     "SourceBuffer.cpp",
+     "SourceBufferList.cpp",
+diff --git a/dom/media/moz.build b/dom/media/moz.build
+index af9a8c99f02d..791d6921911b 100644
+--- a/dom/media/moz.build
++++ b/dom/media/moz.build
+@@ -310,6 +310,7 @@ UNIFIED_SOURCES += [
+     "MediaDecoderStateMachineBase.cpp",
+     "MediaDeviceInfo.cpp",
+     "MediaDevices.cpp",
++    "MediaDumpMuxer.cpp",
+     "MediaFormatReader.cpp",
+     "MediaInfo.cpp",
+     "MediaManager.cpp",
+diff --git a/dom/webidl/HTMLMediaElement.webidl b/dom/webidl/HTMLMediaElement.webidl
+index 3a2ddefed7fe..b2476eb524a0 100644
+--- a/dom/webidl/HTMLMediaElement.webidl
++++ b/dom/webidl/HTMLMediaElement.webidl
+@@ -105,13 +105,14 @@ partial interface HTMLMediaElement {
+   [Func="MediaUtils::HasDebuggerOrTabsPrivilege"]
+   readonly attribute MediaSource? mozMediaSourceObject;
+ 
+-  // Dumps the raw bytes appended to every SourceBuffer of this element's
+-  // attached MediaSource, one file per track, to aDirPath. No-op if there
+-  // is no attached MediaSource. See MseStreamDumper.h.
++  // Dumps this element's demuxed (compressed, pre-decode) audio/video
++  // samples to a file under aDirPath as they're demuxed, regardless of
++  // whether playback is MSE-, blob-, or plain URL-backed. No-op if there
++  // is no attached decoder. See MediaDumpMuxer.h.
+   [ChromeOnly]
+-  undefined startMseDump(DOMString aDirPath);
++  undefined startMediaDump(DOMString aDirPath);
+   [ChromeOnly]
+-  undefined stopMseDump();
++  undefined stopMediaDump();
+ 
+   [Func="MediaUtils::HasDebuggerOrTabsPrivilege", NewObject]
+   Promise<HTMLMediaElementDebugInfo> mozRequestDebugInfo();
+-- 
+2.46.0.windows.1
+

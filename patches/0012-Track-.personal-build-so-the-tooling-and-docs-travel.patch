@@ -1,0 +1,521 @@
+From 3a9a0a7e7bc07cff2f99099e98e62fa52b533fc3 Mon Sep 17 00:00:00 2001
+From: FNGarvin <184324400+FNGarvin@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 13:50:00 -0500
+Subject: [PATCH 12/12] Track .personal-build/ so the tooling and docs travel
+ with the branch
+
+Previously deliberately untracked (kept off main by never committing it),
+but that also meant it wasn't archived/portable with the rest of this
+branch's work. Adds SETUP.md: recovery instructions plus every non-obvious
+gotcha discovered while building this (MOZILLABUILD path, the
+build-binaries-stale-header trap, NS_WARNING being a no-op outside DEBUG
+builds, content-process stderr not being visible via -attach-console,
+mach build installer not being a real target, etc.) so this is recoverable
+from scratch without re-learning all of it the hard way.
+---
+ .personal-build/SETUP.md                  | 182 ++++++++++++++++++++++
+ .personal-build/package-for-transport.ps1 | 100 ++++++++++++
+ .personal-build/poison-paths.txt          |   7 +
+ .personal-build/run-media-dump-build.bat  |  26 ++++
+ .personal-build/update-and-build.ps1      | 146 +++++++++++++++++
+ 5 files changed, 461 insertions(+)
+ create mode 100644 .personal-build/SETUP.md
+ create mode 100644 .personal-build/package-for-transport.ps1
+ create mode 100644 .personal-build/poison-paths.txt
+ create mode 100644 .personal-build/run-media-dump-build.bat
+ create mode 100644 .personal-build/update-and-build.ps1
+
+diff --git a/.personal-build/SETUP.md b/.personal-build/SETUP.md
+new file mode 100644
+index 000000000000..39df30b6a8b2
+--- /dev/null
++++ b/.personal-build/SETUP.md
+@@ -0,0 +1,182 @@
++# Custom Firefox "media dump" build — recovery notes
++
++This is a personal, never-upstreamed fork of Firefox that adds a
++"right-click a playing video/audio element and save it" capability that
++works regardless of how the page is streaming it (MSE, blob-backed, or a
++plain URL) — see the design notes and full history in this branch's commit
++log for the "why". This file is what you need to get the environment
++working again from scratch, e.g. on a new PC. It captures hard-won,
++non-obvious gotchas from the original build session, not just the happy
++path.
++
++## What's actually archived, and why
++
++`mozilla-source` is a full clone of Mozilla's entire multi-decade history
++(many GB). That's never what gets archived here — it's fully reproducible
++by cloning Mozilla's own public repo again, and archiving a redundant copy
++of public upstream history would be wasteful. What's archived is only the
++*delta*:
++
++- The commits unique to the `media-dump` branch (as patch files — see
++  `patches/` next to this file, or wherever this SETUP.md ended up).
++- This `.personal-build/` directory itself (these scripts, the poison-paths
++  manifest, this doc) — tracked as part of those same commits.
++
++## Recreating the environment on a new PC
++
++1. **Clone mozilla-central:**
++   ```
++   git clone https://github.com/mozilla-firefox/firefox mozilla-source
++   ```
++   This will take a while and use significant disk space (tens of GB).
++
++2. **Recreate the sibling directory layout.** The scripts here assume a
++   layout like:
++   ```
++   <root>\
++     mozilla-source\   <- the clone from step 1
++     mozilla-build\    <- MozillaBuild (https://ftp.mozilla.org/pub/mozilla/libraries/win32/MozillaBuildSetup-latest.exe)
++     .mozbuild\         <- created by `mach bootstrap`
++     .cargo\ .rustup\   <- created by `mach bootstrap` / rustup
++   ```
++   If you put things somewhere other than `E:\mozilla\`, you'll need to
++   adjust the hardcoded `E:\mozilla\mozilla-build` fallback path near the
++   top of `update-and-build.ps1` / `package-for-transport.ps1` (they only
++   use it if `$env:MOZILLABUILD` isn't already set) and the relative paths
++   in `run-media-dump-build.bat`.
++
++3. **Create the `media-dump` branch and apply the archived patches:**
++   ```
++   cd mozilla-source
++   git checkout -b media-dump
++   git am /path/to/archive/patches/*.patch
++   ```
++   `git am` applies them as real commits, preserving the original commit
++   messages (which have a lot of the "why" behind non-obvious code, e.g.
++   why several things needed real bug fixes discovered only through actual
++   `ffprobe`-verified testing, not just compiling).
++
++4. **Bootstrap the toolchain:**
++   ```
++   ./mach bootstrap
++   ```
++   This installs rustup, cargo, clang, nasm, etc. into `.mozbuild`/
++   `.cargo`/`.rustup`. It's also what the repo's own `AGENTS.md` recommends
++   for getting `searchfox-cli` if you want to explore the codebase with an
++   AI agent's help again later.
++
++5. **Set `MOZILLABUILD` and build:**
++   ```
++   $env:MOZILLABUILD = "<root>\mozilla-build"
++   ./mach.ps1 build
++   ```
++   Or just run `.\.personal-build\update-and-build.ps1` — it sets this
++   itself, and additionally pulls latest upstream + rebases first (safe to
++   run even on a brand new checkout; it'll just be a no-op pull).
++
++6. **Run it:** `.\.personal-build\run-media-dump-build.bat` (or copy it up
++   one level next to `mozilla-build`/`mozilla-source` for convenience, like
++   the original layout had it).
++
++## Ongoing workflows
++
++- **Pulling upstream updates while keeping this branch's changes:**
++  `.\.personal-build\update-and-build.ps1`. Rebases `media-dump` onto the
++  freshly-pulled `main`, re-purges the AI-agent breadcrumb files (see
++  below), and rebuilds. Auto-detects and recovers from the "upstream
++  changed low-level build files, need to clobber" failure mode.
++- **Packaging a build to move to another PC:**
++  `.\.personal-build\package-for-transport.ps1 -Installer`. Collects a
++  portable zip (and the installer .exe) into a timestamped folder under
++  `E:\mozilla\packaged-builds\` (adjust `-OutDir` if needed), with its own
++  `HOW-TO-RUN.txt`. **No special setup is needed on the target PC** for
++  this to work — capture writes go through the parent process now, so a
++  packaged/installed build just runs like a normal Firefox build.
++
++## Non-obvious gotchas discovered building this (read before debugging)
++
++- **`MOZILLABUILD` isn't auto-detected.** `mach` defaults to expecting
++  MozillaBuild at `C:\mozilla-build`; if it's anywhere else, `mach` fails
++  with `AssertionError: MozillaBuild was not found`. Both scripts here set
++  this env var themselves.
++- **`mach build binaries` can compile against a *stale* exported header**
++  if you (or an agent) edits an `EXPORTS`-listed header while a previous
++  background build is still running — it skips the export/header-copy
++  step that a plain `mach build` (or `mach build export`) does. If you get
++  a confusing "declaration doesn't match" error right after editing a
++  header, this is almost certainly why. Non-exported `.cpp`-only edits are
++  safe with `build binaries`.
++- **Upstream occasionally vendors something that requires a clobber**
++  (this happened with a libwebrtc vendoring bump partway through the
++  original session) — `mach build` fails with a message mentioning
++  "clobber". `update-and-build.ps1` detects this and runs `mach clobber`
++  + retries automatically; if you're running `mach build` by hand and hit
++  this, just run `./mach clobber` then build again (it'll be a full
++  rebuild, ~20-30+ min depending on hardware).
++- **`NS_WARNING` is a complete no-op outside `DEBUG` builds** (see
++  `xpcom/base/nsDebug.h`) — this build isn't a DEBUG build, so `NS_WARNING`
++  calls anywhere in this feature's code are silently swallowed. On top of
++  that, **content-process `stderr` is not visible via `mach run`'s
++  `-attach-console`** the way the parent process's is — so neither
++  mechanism reaches you for diagnostics in `dom/media` code (which runs in
++  the content process for a normal tab). The working pattern used here:
++  encode diagnostic info into something that crosses the process boundary
++  on its own, like the dump's own filename (see `MediaDumpMuxer.cpp`'s
++  `ShortCodecTag`) — not console logging.
++- **`mach build installer` is not a real target** (confirmed: fails with
++  "No rule to make target 'installer'"). The installer `.exe` is produced
++  automatically as a side effect of `mach build package` on Windows.
++- **`git add -A`/`git add .` in this repo will stage the untracked
++  `clang/` toolchain download** (hundreds of MB) since it isn't covered by
++  a committed `.gitignore` — it's excluded via this checkout's local
++  `.git/info/exclude` instead (which doesn't travel with clones/patches,
++  so recreate that entry: add a `/clang/` line to the new checkout's own
++  `.git/info/exclude`). Always stage by explicit path in this repo, never
++  a wildcard.
++- **The AI-agent breadcrumb files are deliberately deleted, not missing by
++  accident.** `.agents/skills/`, `.claude/skills/`, `.claude/settings.json`,
++  `.codex/config.toml`, and top-level `README.md`/`CODE_OF_CONDUCT.md`/
++  `SECURITY.md` are intentionally removed on this branch (considered
++  untrustworthy/undesirable content to have influencing any agent working
++  in this tree) — see `poison-paths.txt` for the exact list. Upstream keeps
++  re-adding these on every pull; `update-and-build.ps1`'s purge step is
++  what keeps them gone. If you ever expand this list, update
++  `poison-paths.txt` to match.
++- **`main` should always stay a pure, untouched mirror of `origin/main`.**
++  All feature work lives on `media-dump`; the update workflow relies on
++  being able to safely `git reset --hard origin/main` on `main` without
++  losing anything, specifically because nothing is ever committed there
++  directly.
++
++## Feature summary (as of this archive)
++
++- Right-click "Save Video As"/"Save Audio As" on a playing `<video>`/
++  `<audio>` element: works even when there's no reusable network URL
++  (MSE/blob-backed content), by capturing demuxed samples directly instead
++  of re-fetching. Falls back to the normal instant download when a real
++  URL *is* available, so this is strictly additive.
++- Hooks `MediaFormatReader::OnVideoDemuxCompleted`/`OnAudioDemuxCompleted`
++  (`dom/media/MediaFormatReader.cpp`) — the point every playback pipeline
++  converges at before decode — so it doesn't matter whether the page used
++  MSE, a blob URL, or a plain URL.
++- Muxes into a single Matroska (`.mkv`) file per element via
++  `dom/media/MediaDumpMuxer.{h,cpp}`, reusing Gecko's existing low-level
++  EBML primitives (`media/libmkv`, the same ones `MediaRecorder`'s
++  `WebMWriter` uses) but reading each track's actual codec instead of
++  assuming one.
++- Supported codecs: video VP8/VP9/H.264/AV1, audio Opus/Vorbis/AAC. Not
++  yet supported: HEVC and anything more exotic (falls back to audio-only
++  output, now clearly labeled in the filename e.g.
++  `-unsupported-video-hevc-...`, rather than silently producing a broken
++  file).
++- Content-process sandbox stays enabled: file writes go through a new
++  `PContent` IPC round trip (`RequestMediaDumpFile`, `dom/ipc/PContent.ipdl`
++  + `ContentParent.cpp`) modeled on Gecko's existing anonymous-temp-file
++  mechanism, except it opens a real, user-chosen, persistent path.
++- DRM/EME content is excluded: encrypted samples are dropped at the sample
++  level (`MediaRawData::mCrypto.IsEncrypted()`), never written.
++- **Known limitation:** capture only starts from the *next* keyframe after
++  arming, not retroactively — if you want the whole video, seek/restart
++  playback to 0:00 right after picking the save folder, since a decoder
++  restart always delivers a keyframe next. No pre-roll buffer exists (yet)
++  for "capture what I've already been watching."
+diff --git a/.personal-build/package-for-transport.ps1 b/.personal-build/package-for-transport.ps1
+new file mode 100644
+index 000000000000..78b7795eb81b
+--- /dev/null
++++ b/.personal-build/package-for-transport.ps1
+@@ -0,0 +1,100 @@
++#!/usr/bin/env pwsh
++# Packages the CURRENT build state (does not pull/rebuild first -- run
++# update-and-build.ps1 beforehand if you want the latest changes) and
++# collects the resulting artifact(s) into a clearly labeled folder you can
++# copy to another PC.
++#
++# Usage: .\.personal-build\package-for-transport.ps1 [-Installer] [-OutDir <path>]
++#   -Installer   Also collect the installer .exe. It's built automatically as
++#                part of `mach build package` on Windows -- there's no separate
++#                `mach build installer` target (confirmed: that name doesn't
++#                exist) -- this flag only controls whether it gets copied too.
++#   -OutDir      Where to collect artifacts (default: E:\mozilla\packaged-builds).
++
++param(
++    [switch]$Installer,
++    [string]$OutDir = "E:\mozilla\packaged-builds"
++)
++
++$ErrorActionPreference = "Stop"
++$RepoRoot = Split-Path -Parent $PSScriptRoot
++Set-Location $RepoRoot
++
++if (-not (Test-Path env:MOZILLABUILD)) {
++    $env:MOZILLABUILD = "E:\mozilla\mozilla-build"
++}
++
++function Fail($msg) {
++    Write-Error $msg
++    exit 1
++}
++
++$branch = git rev-parse --abbrev-ref HEAD
++$commit = git rev-parse --short HEAD
++Write-Host "== Packaging branch '$branch' @ $commit ==" -ForegroundColor Cyan
++
++Write-Host "== Building (mach will only redo what's stale) ==" -ForegroundColor Cyan
++& .\mach.ps1 build
++if ($LASTEXITCODE -ne 0) {
++    Fail "mach build failed. If the error mentions 'clobber', run update-and-build.ps1 first -- it handles that automatically."
++}
++
++Write-Host "== Packaging (this also produces the installer .exe on Windows) ==" -ForegroundColor Cyan
++& .\mach.ps1 build package
++if ($LASTEXITCODE -ne 0) { Fail "mach build package failed." }
++
++$objDir = Get-ChildItem -Path $RepoRoot -Directory -Filter "obj-*" | Select-Object -First 1
++if (-not $objDir) { Fail "Could not find the object directory (obj-*) under $RepoRoot." }
++$distDir = Join-Path $objDir.FullName "dist"
++
++$zip = Get-ChildItem -Path $distDir -Filter "*.zip" -ErrorAction SilentlyContinue |
++    Sort-Object LastWriteTime -Descending | Select-Object -First 1
++$exe = $null
++if ($Installer) {
++    $exe = Get-ChildItem -Path $distDir -Filter "*.installer.exe" -Recurse -ErrorAction SilentlyContinue |
++        Sort-Object LastWriteTime -Descending | Select-Object -First 1
++}
++if (-not $zip -and -not $exe) {
++    Fail "Couldn't find a packaged artifact under $distDir -- packaging may have silently produced something with an unexpected name."
++}
++
++$stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
++$destDir = Join-Path $OutDir "$stamp-$commit"
++New-Item -ItemType Directory -Force -Path $destDir | Out-Null
++
++$collected = @()
++if ($zip) {
++    Copy-Item $zip.FullName -Destination $destDir
++    $collected += (Join-Path $destDir $zip.Name)
++}
++if ($exe) {
++    Copy-Item $exe.FullName -Destination $destDir
++    $collected += (Join-Path $destDir $exe.Name)
++}
++
++$notes = @"
++Custom Firefox build ($branch @ $commit), packaged $stamp.
++
++To run on another PC:
++  1. Copy this whole folder over (USB drive, network share, whatever).
++  2. If a .zip is present: extract it anywhere and run firefox.exe inside.
++     No installation, no special environment variables needed -- the media
++     dump feature works through the normal content sandbox now (writes go
++     via the parent process), so this just runs like a normal portable
++     Firefox build.
++  3. If a .installer.exe is present instead/also: run it like any other
++     Windows installer.
++
++To use the "Dump Media Stream" / "Save Video As" capture feature: right-click
++a playing video or audio element, pick Save Video/Audio As (it no longer
++greys out for MSE/blob-backed media), choose a folder, and let it play --
++capture starts from the next keyframe, so seek to the start right after
++picking the folder if you want the whole thing.
++"@
++Set-Content -Path (Join-Path $destDir "HOW-TO-RUN.txt") -Value $notes
++
++Write-Host ""
++Write-Host "== Done ==" -ForegroundColor Green
++Write-Host "Collected into: $destDir"
++foreach ($f in $collected) { Write-Host "  - $f" }
++Write-Host "  - $(Join-Path $destDir 'HOW-TO-RUN.txt')"
+diff --git a/.personal-build/poison-paths.txt b/.personal-build/poison-paths.txt
+new file mode 100644
+index 000000000000..06c341a8cae9
+--- /dev/null
++++ b/.personal-build/poison-paths.txt
+@@ -0,0 +1,7 @@
++.agents/skills
++.claude/settings.json
++.claude/skills
++.codex/config.toml
++CODE_OF_CONDUCT.md
++README.md
++SECURITY.md
+diff --git a/.personal-build/run-media-dump-build.bat b/.personal-build/run-media-dump-build.bat
+new file mode 100644
+index 000000000000..8d9087cf56a2
+--- /dev/null
++++ b/.personal-build/run-media-dump-build.bat
+@@ -0,0 +1,26 @@
++@echo off
++rem Launches the custom media-dump Firefox build. Media dumps now write via
++rem the parent process (see dom/ipc/PContent.ipdl's RequestMediaDumpFile),
++rem so the content sandbox no longer needs to be disabled for this feature.
++rem
++rem This is the archived/tracked copy of this script (lives in the repo, so
++rem it travels with the code). A convenience copy normally also sits one
++rem level up, at the root of the whole mozilla checkout (sibling to
++rem mozilla-source/ and mozilla-build/) -- see SETUP.md in this directory
++rem for how to recreate that layout from scratch on a new machine.
++
++setlocal
++rem This script lives in <root>\mozilla-source\.personal-build\, so
++rem MozillaBuild is two levels up, and mozilla-source is one level up.
++set "MOZILLABUILD=%~dp0..\..\mozilla-build"
++rem If something breaks and you want to isolate whether it's sandbox-related,
++rem uncomment the next line to fall back to the old direct-write behavior:
++rem set "MOZ_DISABLE_CONTENT_SANDBOX=1"
++
++cd /d "%~dp0.."
++call mach run
++
++echo.
++echo ==== mach run exited (code %ERRORLEVEL%) ====
++pause
++endlocal
+diff --git a/.personal-build/update-and-build.ps1 b/.personal-build/update-and-build.ps1
+new file mode 100644
+index 000000000000..48e7244cfe8e
+--- /dev/null
++++ b/.personal-build/update-and-build.ps1
+@@ -0,0 +1,146 @@
++#!/usr/bin/env pwsh
++# Pull latest origin/main, rebase the media-dump feature branch onto it,
++# re-purge the AI-agent breadcrumb files, and rebuild.
++#
++# Usage: .\.personal-build\update-and-build.ps1 [-SkipBuild] [-Package]
++#   -SkipBuild   Stop after the git update/purge steps; don't build at all.
++#   -Package     Also run `mach build package` (produces both the portable zip
++#                and, as an automatic side effect on Windows, the installer
++#                .exe -- there's no separate installer build step). Prefer
++#                package-for-transport.ps1 instead when you actually want to
++#                ship a build somewhere: it collects and labels the artifacts
++#                properly instead of leaving them buried under the obj dir.
++
++param(
++    [switch]$SkipBuild,
++    [switch]$Package
++)
++
++$ErrorActionPreference = "Stop"
++$RepoRoot = Split-Path -Parent $PSScriptRoot
++Set-Location $RepoRoot
++
++# mach defaults to looking for MozillaBuild at C:\mozilla-build; this setup
++# has it under the repo's parent directory instead.
++if (-not (Test-Path env:MOZILLABUILD)) {
++    $env:MOZILLABUILD = "E:\mozilla\mozilla-build"
++}
++
++function Fail($msg) {
++    Write-Error $msg
++    exit 1
++}
++
++# Runs `mach.ps1 build [$Target]`, and if it fails specifically because
++# upstream changed low-level build files (e.g. the libwebrtc-vendoring
++# incident that hit this checkout once already), clobbers and retries once
++# automatically -- that failure mode is expected/routine after a stale
++# checkout catches up, not something to stop and ask about every time.
++function Invoke-MachBuild {
++    param([string]$Target = "")
++    $logFile = Join-Path $env:TEMP "mach-build-$([guid]::NewGuid()).log"
++    if ($Target) {
++        & .\mach.ps1 build $Target 2>&1 | Tee-Object -FilePath $logFile
++    } else {
++        & .\mach.ps1 build 2>&1 | Tee-Object -FilePath $logFile
++    }
++    if ($LASTEXITCODE -eq 0) {
++        Remove-Item $logFile -ErrorAction SilentlyContinue
++        return
++    }
++
++    $needsClobber = Select-String -Path $logFile -Pattern "clobber" -Quiet
++    Remove-Item $logFile -ErrorAction SilentlyContinue
++    if (-not $needsClobber) {
++        Fail "mach build $Target failed (not a clobber issue -- see output above)."
++    }
++
++    Write-Host "== Upstream changed low-level build files; clobbering and retrying (this will be a full rebuild) ==" -ForegroundColor Yellow
++    & .\mach.ps1 clobber
++    if ($LASTEXITCODE -ne 0) { Fail "mach clobber failed." }
++
++    if ($Target) {
++        & .\mach.ps1 build $Target
++    } else {
++        & .\mach.ps1 build
++    }
++    if ($LASTEXITCODE -ne 0) { Fail "mach build $Target failed even after clobbering." }
++}
++
++Write-Host "== Checking working tree state ==" -ForegroundColor Cyan
++$currentBranch = git rev-parse --abbrev-ref HEAD
++if ($currentBranch -ne "media-dump") {
++    Fail "Expected to be on branch 'media-dump', currently on '$currentBranch'. Switch manually and re-run."
++}
++
++$dirty = git status --porcelain
++if ($dirty) {
++    Write-Host $dirty
++    Fail "Working tree has uncommitted changes. Commit or stash them before running this script."
++}
++
++Write-Host "== Fetching origin ==" -ForegroundColor Cyan
++git fetch origin
++if ($LASTEXITCODE -ne 0) { Fail "git fetch failed." }
++
++Write-Host "== Fast-forwarding main to origin/main ==" -ForegroundColor Cyan
++git checkout main
++if ($LASTEXITCODE -ne 0) { Fail "Could not check out main." }
++git reset --hard origin/main
++if ($LASTEXITCODE -ne 0) { Fail "Could not reset main to origin/main." }
++
++Write-Host "== Rebasing media-dump onto main ==" -ForegroundColor Cyan
++git checkout media-dump
++if ($LASTEXITCODE -ne 0) { Fail "Could not check out media-dump." }
++git rebase main
++if ($LASTEXITCODE -ne 0) {
++    Write-Host ""
++    Write-Host "Rebase stopped with conflicts. Resolve manually:" -ForegroundColor Yellow
++    git status --porcelain | Where-Object { $_ -match '^(UU|AA|DD|AU|UA|UD|DU)' }
++    Write-Host ""
++    Write-Host "After resolving: git rebase --continue" -ForegroundColor Yellow
++    Write-Host "(This script will not resolve conflicts or abort the rebase for you.)"
++    exit 1
++}
++
++Write-Host "== Re-purging agent-breadcrumb paths ==" -ForegroundColor Cyan
++$manifest = Join-Path $PSScriptRoot "poison-paths.txt"
++if (-not (Test-Path $manifest)) {
++    Fail "Missing manifest: $manifest"
++}
++$purged = @()
++foreach ($line in Get-Content $manifest) {
++    $path = $line.Trim()
++    if ([string]::IsNullOrWhiteSpace($path) -or $path.StartsWith("#")) { continue }
++    $full = Join-Path $RepoRoot $path
++    if (Test-Path $full) {
++        Remove-Item -Recurse -Force $full
++        $purged += $path
++    }
++}
++if ($purged.Count -gt 0) {
++    Write-Host "Purged: $($purged -join ', ')"
++} else {
++    Write-Host "Nothing to purge (already clean)."
++}
++
++if ($SkipBuild) {
++    Write-Host "== -SkipBuild passed, stopping before build ==" -ForegroundColor Yellow
++    exit 0
++}
++
++Write-Host "== Building ==" -ForegroundColor Cyan
++Invoke-MachBuild
++
++if ($Package) {
++    Write-Host "== Packaging ==" -ForegroundColor Cyan
++    Invoke-MachBuild -Target "package"
++}
++
++Write-Host ""
++Write-Host "== Done ==" -ForegroundColor Green
++if ($Package) {
++    Write-Host "Run .\.personal-build\package-for-transport.ps1 to collect the packaged artifact(s) into an easy-to-find, labeled folder."
++} else {
++    Write-Host "Build is up to date. Run .\.personal-build\package-for-transport.ps1 when you want to ship this build to another PC."
++}
+-- 
+2.46.0.windows.1
+

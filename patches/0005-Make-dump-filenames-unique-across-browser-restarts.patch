@@ -1,0 +1,44 @@
+From df1e23c7e2dd74242f6af538acbb097fa7407a1d Mon Sep 17 00:00:00 2001
+From: FNGarvin <184324400+FNGarvin@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 16:28:03 -0500
+Subject: [PATCH 05/12] Make dump filenames unique across browser restarts
+
+The per-process counter alone reset to 1 on every launch, silently
+overwriting the previous session's mediadump-1.mkv. Fold in PR_Now() too.
+---
+ dom/media/MediaDumpMuxer.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/dom/media/MediaDumpMuxer.cpp b/dom/media/MediaDumpMuxer.cpp
+index f455e11cc4f8..6f10ffec3dee 100644
+--- a/dom/media/MediaDumpMuxer.cpp
++++ b/dom/media/MediaDumpMuxer.cpp
+@@ -15,6 +15,7 @@
+ #include "mozilla/Atomics.h"
+ #include "mozilla/UniquePtr.h"
+ #include "nsThreadUtils.h"
++#include "prtime.h"
+ 
+ #ifdef XP_WIN
+ #  include "nsString.h"
+@@ -161,10 +162,15 @@ void MediaDumpMuxer::Init(const nsACString& aDirPath, const VideoInfo* aVideo,
+   nsTArray<uint8_t> header;
+   header.AppendElements(buffer.get(), ebml.offset);
+ 
++  // PR_Now() (microseconds since epoch) keeps filenames unique across
++  // browser restarts, not just within one process's lifetime -- a plain
++  // per-process counter starts back at 1 every launch and silently
++  // clobbers the previous session's dump of the same name.
+   static Atomic<uint32_t> sNextDumpId(0);
+   nsAutoCString path;
+-  path.AppendPrintf("%s/mediadump-%u.mkv",
+-                    PromiseFlatCString(aDirPath).get(), ++sNextDumpId);
++  path.AppendPrintf("%s/mediadump-%lld-%u.mkv",
++                    PromiseFlatCString(aDirPath).get(),
++                    static_cast<long long>(PR_Now()), ++sNextDumpId);
+   mSink = new MediaDumpSink(std::move(path));
+ 
+   RefPtr<SharedThreadPool> pool =
+-- 
+2.46.0.windows.1
+

@@ -1,0 +1,387 @@
+From 2373ee81dfe47367362944d258af21cdead60632 Mon Sep 17 00:00:00 2001
+From: FNGarvin <184324400+FNGarvin@users.noreply.github.com>
+Date: Tue, 15 Sep 2026 22:20:40 -0500
+Subject: [PATCH 07/12] Fold capture into Save Video/Audio As; name dumps after
+ the page title
+
+Save Video/Audio As no longer greys out for MSE/blob-backed media with no
+reusable URL -- it now falls back to the same demux-level capture used by
+the (now-removed) separate "Dump Media Stream" item. Only truly-nothing-
+can-be-done content (DRM with no fallback URL) stays disabled. Unlike a
+normal save this doesn't produce a file instantly: it arms capture and the
+file is written as playback continues.
+
+Also renamed the aDirPath parameter to aPathPrefix throughout the chain
+(WebIDL down to MediaDumpMuxer) to match what it actually is now: dump
+filenames are built from a folder path joined with the page's sanitized
+title (via the existing getFrameTitle()/DownloadPaths.sanitize() utilities
+already used elsewhere in this file), not just a bare directory, so dumps
+are identifiable without opening them first.
+---
+ .../base/content/browser-context.inc.xhtml    |  3 -
+ browser/base/content/browser-context.js       |  3 -
+ browser/base/content/nsContextMenu.sys.mjs    | 77 ++++++++++++-------
+ .../locales/en-US/browser/browserContext.ftl  |  4 -
+ dom/media/MediaDecoder.cpp                    |  4 +-
+ dom/media/MediaDecoder.h                      |  2 +-
+ dom/media/MediaDumpMuxer.cpp                  |  7 +-
+ dom/media/MediaDumpMuxer.h                    |  8 +-
+ dom/media/MediaFormatReader.cpp               |  8 +-
+ dom/media/MediaFormatReader.h                 | 11 +--
+ dom/media/mediaelement/HTMLMediaElement.cpp   |  4 +-
+ dom/media/mediaelement/HTMLMediaElement.h     |  2 +-
+ dom/webidl/HTMLMediaElement.webidl            |  9 ++-
+ 13 files changed, 78 insertions(+), 64 deletions(-)
+
+diff --git a/browser/base/content/browser-context.inc.xhtml b/browser/base/content/browser-context.inc.xhtml
+index 56c8bff44c09..621be24e4e0c 100644
+--- a/browser/base/content/browser-context.inc.xhtml
++++ b/browser/base/content/browser-context.inc.xhtml
+@@ -225,9 +225,6 @@
+       <menuitem id="context-saveaudio"
+                 data-l10n-id="main-context-menu-audio-save-as"
+                 />
+-      <menuitem id="context-dumpmediastream"
+-                data-l10n-id="main-context-menu-media-dump-stream"
+-                />
+       <menuitem id="context-copyimage-contents"
+                 data-l10n-id="main-context-menu-image-copy"
+                 />
+diff --git a/browser/base/content/browser-context.js b/browser/base/content/browser-context.js
+index 1f818ba5e359..042341cecb1a 100644
+--- a/browser/base/content/browser-context.js
++++ b/browser/base/content/browser-context.js
+@@ -136,9 +136,6 @@ document.addEventListener(
+         case "context-savevideo":
+           gContextMenu.saveMedia();
+           break;
+-        case "context-dumpmediastream":
+-          gContextMenu.dumpMediaStream();
+-          break;
+         case "context-copyimage-contents":
+           if (gContextMenu.onCanvas) {
+             gContextMenu.copyCanvasImage();
+diff --git a/browser/base/content/nsContextMenu.sys.mjs b/browser/base/content/nsContextMenu.sys.mjs
+index f87e986ae065..33bee0d9abb2 100644
+--- a/browser/base/content/nsContextMenu.sys.mjs
++++ b/browser/base/content/nsContextMenu.sys.mjs
+@@ -14,6 +14,7 @@ ChromeUtils.defineESModuleGetters(lazy, {
+   ContextualIdentityService:
+     "moz-src:///toolkit/components/contextualidentity/ContextualIdentityService.sys.mjs",
+   DevToolsShim: "chrome://devtools-startup/content/DevToolsShim.sys.mjs",
++  DownloadPaths: "resource://gre/modules/DownloadPaths.sys.mjs",
+   E10SUtils: "resource://gre/modules/E10SUtils.sys.mjs",
+   GenAI: "resource:///modules/GenAI.sys.mjs",
+   LinkPreview: "moz-src:///browser/components/genai/LinkPreview.sys.mjs",
+@@ -671,8 +672,21 @@ export class nsContextMenu {
+     this.showItem("context-savevideo", this.onVideo);
+     this.showItem("context-saveaudio", this.onAudio);
+     this.showItem("context-video-saveimage", this.onVideo);
+-    this.setItemAttr("context-savevideo", "disabled", !this.mediaURL);
+-    this.setItemAttr("context-saveaudio", "disabled", !this.mediaURL);
++    // Only truly unusable when there's neither a reusable network URL nor
++    // any playable (non-DRM) samples to fall back to capturing directly --
++    // see the saveMedia() fallback to dumpMediaStream() below and
++    // MediaDumpMuxer.h. That fallback means this is essentially never
++    // disabled for ordinary (non-DRM) media anymore.
++    this.setItemAttr(
++      "context-savevideo",
++      "disabled",
++      !this.mediaURL && this.onDRMMedia
++    );
++    this.setItemAttr(
++      "context-saveaudio",
++      "disabled",
++      !this.mediaURL && this.onDRMMedia
++    );
+     this.showItem("context-sendvideo", this.onVideo);
+     this.showItem("context-sendaudio", this.onAudio);
+     let mediaIsBlob = this.mediaURL.startsWith("blob:");
+@@ -687,15 +701,6 @@ export class nsContextMenu {
+       !this.mediaURL || mediaIsBlob
+     );
+ 
+-    // Works regardless of how the element is being played back (MSE, blob,
+-    // or a plain URL) since it captures demuxed samples, not the source --
+-    // see MediaDumpMuxer.h. DRM'd content is excluded since we never see
+-    // decrypted bytes for it.
+-    this.showItem(
+-      "context-dumpmediastream",
+-      (this.onVideo || this.onAudio) && !this.onDRMMedia
+-    );
+-
+     if (
+       Services.policies.status === Services.policies.ACTIVE &&
+       !Services.policies.isAllowed("filepickers")
+@@ -710,7 +715,6 @@ export class nsContextMenu {
+         "context-saveaudio",
+         "context-video-saveimage",
+         "context-saveaudio",
+-        "context-dumpmediastream",
+       ]) {
+         this.setItemAttr(item, "disabled", true);
+       }
+@@ -2237,6 +2241,15 @@ export class nsContextMenu {
+         principal
+       );
+     } else if (this.onVideo || this.onAudio) {
++      if (!this.mediaURL) {
++        // No reusable network URL (MSE, blob, etc.) -- fall back to
++        // capturing demuxed samples directly instead of leaving Save As
++        // permanently unusable. See dumpMediaStream(). Unlike the normal
++        // path this doesn't produce a file immediately: it arms capture
++        // and the file is written as playback continues.
++        this.dumpMediaStream();
++        return;
++      }
+       let defaultFileName = "";
+       if (this.mediaURL.startsWith("data")) {
+         // Use default file name "Untitled" for data URIs
+@@ -2627,22 +2640,30 @@ export class nsContextMenu {
+   }
+ 
+   dumpMediaStream() {
+-    const fp = Cc["@mozilla.org/filepicker;1"].createInstance(
+-      Ci.nsIFilePicker
+-    );
+-    fp.init(
+-      this.window.browsingContext,
+-      "Choose a folder to dump the media stream to",
+-      Ci.nsIFilePicker.modeGetFolder
+-    );
+-    fp.open(rv => {
+-      if (
+-        rv != Ci.nsIFilePicker.returnOK &&
+-        rv != Ci.nsIFilePicker.returnReplace
+-      ) {
+-        return;
+-      }
+-      this.mediaCommand("dumpMediaStream", fp.file.path);
++    this.actor.getFrameTitle(this.targetIdentifier).then(title => {
++      const fp = Cc["@mozilla.org/filepicker;1"].createInstance(
++        Ci.nsIFilePicker
++      );
++      fp.init(
++        this.window.browsingContext,
++        "Choose a folder to dump the media stream to",
++        Ci.nsIFilePicker.modeGetFolder
++      );
++      fp.open(rv => {
++        if (
++          rv != Ci.nsIFilePicker.returnOK &&
++          rv != Ci.nsIFilePicker.returnReplace
++        ) {
++          return;
++        }
++        // MediaDumpMuxer treats this as a filename prefix, not a bare
++        // directory -- it appends "-<timestamp>-<n>.mkv" itself. Build in
++        // the page title here so dumps are identifiable without having to
++        // open them first.
++        const safeTitle = lazy.DownloadPaths.sanitize(title || "media");
++        const prefix = PathUtils.join(fp.file.path, safeTitle);
++        this.mediaCommand("dumpMediaStream", prefix);
++      });
+     });
+   }
+ 
+diff --git a/browser/locales/en-US/browser/browserContext.ftl b/browser/locales/en-US/browser/browserContext.ftl
+index d043cbcd9136..85b875194acf 100644
+--- a/browser/locales/en-US/browser/browserContext.ftl
++++ b/browser/locales/en-US/browser/browserContext.ftl
+@@ -334,10 +334,6 @@ main-context-menu-audio-save-as =
+     .label = Save Audio As…
+     .accesskey = v
+ 
+-main-context-menu-media-dump-stream =
+-    .label = Dump Media Stream…
+-    .accesskey = D
+-
+ main-context-menu-video-take-snapshot =
+     .label = Take Snapshot…
+     .accesskey = S
+diff --git a/dom/media/MediaDecoder.cpp b/dom/media/MediaDecoder.cpp
+index efc5c2521f53..dab4840a788d 100644
+--- a/dom/media/MediaDecoder.cpp
++++ b/dom/media/MediaDecoder.cpp
+@@ -1643,12 +1643,12 @@ void MediaDecoder::GetDebugInfo(dom::MediaDecoderDebugInfo& aInfo) {
+       NS_ConvertUTF8toUTF16(ContainerType().Type().AsString());
+ }
+ 
+-void MediaDecoder::StartMediaDump(const nsACString& aDirPath) {
++void MediaDecoder::StartMediaDump(const nsACString& aPathPrefix) {
+   MOZ_ASSERT(NS_IsMainThread());
+   if (!mReader) {
+     return;
+   }
+-  mReader->StartMediaDump(aDirPath);
++  mReader->StartMediaDump(aPathPrefix);
+ }
+ 
+ void MediaDecoder::StopMediaDump() {
+diff --git a/dom/media/MediaDecoder.h b/dom/media/MediaDecoder.h
+index 44b4da91ce61..41a6208de6c6 100644
+--- a/dom/media/MediaDecoder.h
++++ b/dom/media/MediaDecoder.h
+@@ -476,7 +476,7 @@ class MediaDecoder : public DecoderDoctorLifeLogger<MediaDecoder> {
+ 
+   // See MediaFormatReader::StartMediaDump/StopMediaDump. No-op if this
+   // decoder has no reader (e.g. shut down).
+-  void StartMediaDump(const nsACString& aDirPath);
++  void StartMediaDump(const nsACString& aPathPrefix);
+   void StopMediaDump();
+ 
+   virtual bool IsHLSDecoder() const { return false; }
+diff --git a/dom/media/MediaDumpMuxer.cpp b/dom/media/MediaDumpMuxer.cpp
+index ef58af4fd8f9..31dd1d0886f9 100644
+--- a/dom/media/MediaDumpMuxer.cpp
++++ b/dom/media/MediaDumpMuxer.cpp
+@@ -147,8 +147,8 @@ void MediaDumpMuxer::DispatchWrite(nsTArray<uint8_t>&& aBytes) {
+   NS_ENSURE_SUCCESS_VOID(rv);
+ }
+ 
+-void MediaDumpMuxer::Init(const nsACString& aDirPath, const VideoInfo* aVideo,
+-                          const AudioInfo* aAudio) {
++void MediaDumpMuxer::Init(const nsACString& aPathPrefix,
++                          const VideoInfo* aVideo, const AudioInfo* aAudio) {
+   MOZ_ASSERT(!mInitialized);
+   mInitialized = true;
+ 
+@@ -226,8 +226,7 @@ void MediaDumpMuxer::Init(const nsACString& aDirPath, const VideoInfo* aVideo,
+   // clobbers the previous session's dump of the same name.
+   static Atomic<uint32_t> sNextDumpId(0);
+   nsAutoCString path;
+-  path.AppendPrintf("%s/mediadump-%lld-%u.mkv",
+-                    PromiseFlatCString(aDirPath).get(),
++  path.AppendPrintf("%s-%lld-%u.mkv", PromiseFlatCString(aPathPrefix).get(),
+                     static_cast<long long>(PR_Now()), ++sNextDumpId);
+   mSink = new MediaDumpSink(std::move(path));
+ 
+diff --git a/dom/media/MediaDumpMuxer.h b/dom/media/MediaDumpMuxer.h
+index 53a39fcfed22..d066807a5f5e 100644
+--- a/dom/media/MediaDumpMuxer.h
++++ b/dom/media/MediaDumpMuxer.h
+@@ -66,7 +66,11 @@ class MediaDumpMuxer final {
+   // demuxed) but before any WriteSample call. aVideo/aAudio may be null if
+   // that track doesn't exist. No-op (dump stays permanently disarmed) if
+   // neither track's codec is supported.
+-  void Init(const nsACString& aDirPath, const VideoInfo* aVideo,
++  //
++  // aPathPrefix is a filename prefix (e.g. a directory joined with a
++  // sanitized page title), not a bare directory -- the actual file gets a
++  // "-<timestamp>-<n>.mkv" suffix appended to it.
++  void Init(const nsACString& aPathPrefix, const VideoInfo* aVideo,
+             const AudioInfo* aAudio);
+ 
+   // Feed one demuxed sample for the given track. No-op if Init() wasn't
+@@ -75,8 +79,6 @@ class MediaDumpMuxer final {
+   void WriteSample(bool aIsVideo, MediaRawData* aSample);
+ 
+  private:
+-  void WriteHeader(const nsACString& aDirPath, const VideoInfo* aVideo,
+-                   const AudioInfo* aAudio);
+   void DispatchWrite(nsTArray<uint8_t>&& aBytes);
+ 
+   bool mInitialized = false;
+diff --git a/dom/media/MediaFormatReader.cpp b/dom/media/MediaFormatReader.cpp
+index 188c8ede71b8..c8f4e06dedf2 100644
+--- a/dom/media/MediaFormatReader.cpp
++++ b/dom/media/MediaFormatReader.cpp
+@@ -3458,17 +3458,17 @@ RefPtr<GenericPromise> MediaFormatReader::RequestDebugInfo(
+   return GenericPromise::CreateAndResolve(true, __func__);
+ }
+ 
+-void MediaFormatReader::StartMediaDump(const nsACString& aDirPath) {
++void MediaFormatReader::StartMediaDump(const nsACString& aPathPrefix) {
+   MOZ_ASSERT(NS_IsMainThread());
+-  nsCString dirPath(aDirPath);
++  nsCString pathPrefix(aPathPrefix);
+   nsresult rv = mTaskQueue->Dispatch(NS_NewRunnableFunction(
+       "MediaFormatReader::StartMediaDump",
+-      [self = RefPtr{this}, dirPath]() {
++      [self = RefPtr{this}, pathPrefix]() {
+         if (self->mDumpMuxer || self->mMediaDumpStopped) {
+           return;  // Already armed, or explicitly stopped: first call wins.
+         }
+         self->mDumpMuxer = MakeUnique<MediaDumpMuxer>();
+-        self->mDumpMuxer->Init(dirPath,
++        self->mDumpMuxer->Init(pathPrefix,
+                                self->HasVideo() ? &self->mInfo.mVideo
+                                                  : nullptr,
+                                self->HasAudio() ? &self->mInfo.mAudio
+diff --git a/dom/media/MediaFormatReader.h b/dom/media/MediaFormatReader.h
+index c2da52b43351..dbfbae5c20c9 100644
+--- a/dom/media/MediaFormatReader.h
++++ b/dom/media/MediaFormatReader.h
+@@ -201,11 +201,12 @@ class MediaFormatReader final
+   RefPtr<GenericPromise> RequestDebugInfo(
+       dom::MediaFormatReaderDebugInfo& aInfo);
+ 
+-  // Dumps every demuxed (compressed, pre-decode) sample to a file under
+-  // aDirPath, regardless of what fed this reader's demuxer (MSE, blob, or
+-  // plain URL). See MediaDumpMuxer.h. Must be called on the main thread;
+-  // internally hops to OwnerThread(), matching RequestDebugInfo() above.
+-  void StartMediaDump(const nsACString& aDirPath);
++  // Dumps every demuxed (compressed, pre-decode) sample to a file whose
++  // name starts with aPathPrefix, regardless of what fed this reader's
++  // demuxer (MSE, blob, or plain URL). See MediaDumpMuxer.h. Must be
++  // called on the main thread; internally hops to OwnerThread(), matching
++  // RequestDebugInfo() above.
++  void StartMediaDump(const nsACString& aPathPrefix);
+   void StopMediaDump();
+ 
+   // Switch the video decoder to NullDecoderModule. It might takes effective
+diff --git a/dom/media/mediaelement/HTMLMediaElement.cpp b/dom/media/mediaelement/HTMLMediaElement.cpp
+index f409c887ff74..d92e2201643a 100644
+--- a/dom/media/mediaelement/HTMLMediaElement.cpp
++++ b/dom/media/mediaelement/HTMLMediaElement.cpp
+@@ -2373,11 +2373,11 @@ already_AddRefed<MediaSource> HTMLMediaElement::GetMozMediaSourceObject()
+   return source.forget();
+ }
+ 
+-void HTMLMediaElement::StartMediaDump(const nsAString& aDirPath) {
++void HTMLMediaElement::StartMediaDump(const nsAString& aPathPrefix) {
+   if (!mDecoder) {
+     return;
+   }
+-  mDecoder->StartMediaDump(NS_ConvertUTF16toUTF8(aDirPath));
++  mDecoder->StartMediaDump(NS_ConvertUTF16toUTF8(aPathPrefix));
+ }
+ 
+ void HTMLMediaElement::StopMediaDump() {
+diff --git a/dom/media/mediaelement/HTMLMediaElement.h b/dom/media/mediaelement/HTMLMediaElement.h
+index 3a6365d15aa3..5ec910a1c670 100644
+--- a/dom/media/mediaelement/HTMLMediaElement.h
++++ b/dom/media/mediaelement/HTMLMediaElement.h
+@@ -693,7 +693,7 @@ class HTMLMediaElement : public nsGenericHTMLElement,
+   // See HTMLMediaElement.webidl. Dumps this element's demuxed (compressed,
+   // pre-decode) media samples to disk, one file per element, regardless of
+   // whether playback is MSE-, blob-, or URL-backed -- see MediaDumpMuxer.h.
+-  void StartMediaDump(const nsAString& aDirPath);
++  void StartMediaDump(const nsAString& aPathPrefix);
+   void StopMediaDump();
+ 
+   // Returns a promise which will be resolved after collecting debugging
+diff --git a/dom/webidl/HTMLMediaElement.webidl b/dom/webidl/HTMLMediaElement.webidl
+index b2476eb524a0..a21e3453e72e 100644
+--- a/dom/webidl/HTMLMediaElement.webidl
++++ b/dom/webidl/HTMLMediaElement.webidl
+@@ -106,11 +106,12 @@ partial interface HTMLMediaElement {
+   readonly attribute MediaSource? mozMediaSourceObject;
+ 
+   // Dumps this element's demuxed (compressed, pre-decode) audio/video
+-  // samples to a file under aDirPath as they're demuxed, regardless of
+-  // whether playback is MSE-, blob-, or plain URL-backed. No-op if there
+-  // is no attached decoder. See MediaDumpMuxer.h.
++  // samples to a file whose name starts with aPathPrefix as they're
++  // demuxed, regardless of whether playback is MSE-, blob-, or plain
++  // URL-backed. No-op if there is no attached decoder. See
++  // MediaDumpMuxer.h.
+   [ChromeOnly]
+-  undefined startMediaDump(DOMString aDirPath);
++  undefined startMediaDump(DOMString aPathPrefix);
+   [ChromeOnly]
+   undefined stopMediaDump();
+ 
+-- 
+2.46.0.windows.1
+
