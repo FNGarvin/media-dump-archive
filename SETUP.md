@@ -1,13 +1,19 @@
-# Custom Firefox "media dump" build — recovery notes
+# Custom Firefox "media dump" build — setup, build, update, package
 
 This is a personal, never-upstreamed fork of Firefox that adds a
 "right-click a playing video/audio element and save it" capability that
 works regardless of how the page is streaming it (MSE, blob-backed, or a
-plain URL) — see the design notes and full history in this branch's commit
-log for the "why". This file is what you need to get the environment
-working again from scratch, e.g. on a new PC. It captures hard-won,
-non-obvious gotchas from the original build session, not just the happy
-path.
+plain URL) — see [Feature summary](#feature-summary) at the bottom for what
+it actually does, and the patch commit messages (`patches/*.patch`, or
+`git log` on the `media-dump` branch) for the "why" behind each change.
+
+This doc is organized around the four things you'll actually want to do:
+[Bootstrap](#1-bootstrap-new-pc-from-scratch) a new machine, [build](#2-building)
+the browser, [update](#3-updating-pull-upstream-while-keeping-changes) it against
+new upstream Firefox code, and [package/transport](#4-packaging--moving-to-another-pc)
+a finished build elsewhere. Read [Gotchas](#gotchas-read-before-debugging) once,
+before debugging anything that looks weird — most weirdness here has already
+been hit and explained.
 
 ## What's actually archived, and why
 
@@ -18,11 +24,14 @@ of public upstream history would be wasteful. What's archived is only the
 *delta*:
 
 - The commits unique to the `media-dump` branch (as patch files — see
-  `patches/` next to this file, or wherever this SETUP.md ended up).
+  `patches/` next to this file).
 - This `.personal-build/` directory itself (these scripts, the poison-paths
-  manifest, this doc) — tracked as part of those same commits.
+  manifest, this doc) — tracked as part of those same commits, so it always
+  travels with the code.
 
-## Recreating the environment on a new PC
+---
+
+## 1. Bootstrap (new PC from scratch)
 
 1. **Clone mozilla-central:**
    ```
@@ -36,14 +45,14 @@ of public upstream history would be wasteful. What's archived is only the
    <root>\
      mozilla-source\   <- the clone from step 1
      mozilla-build\    <- MozillaBuild (https://ftp.mozilla.org/pub/mozilla/libraries/win32/MozillaBuildSetup-latest.exe)
-     .mozbuild\         <- created by `mach bootstrap`
-     .cargo\ .rustup\   <- created by `mach bootstrap` / rustup
+     .mozbuild\        <- created by `mach bootstrap`
+     .cargo\ .rustup\  <- created by `mach bootstrap` / rustup
    ```
-   If you put things somewhere other than `E:\mozilla\`, you'll need to
-   adjust the hardcoded `E:\mozilla\mozilla-build` fallback path near the
-   top of `update-and-build.ps1` / `package-for-transport.ps1` (they only
-   use it if `$env:MOZILLABUILD` isn't already set) and the relative paths
-   in `run-media-dump-build.bat`.
+   The original build used `E:\mozilla\` as `<root>`. If you put things
+   somewhere else, adjust the hardcoded `E:\mozilla\mozilla-build` fallback
+   path near the top of `update-and-build.ps1` / `package-for-transport.ps1`
+   (they only use it if `$env:MOZILLABUILD` isn't already set) and the
+   relative paths in `run-media-dump-build.bat`.
 
 3. **Create the `media-dump` branch and apply the archived patches:**
    ```
@@ -70,35 +79,117 @@ of public upstream history would be wasteful. What's archived is only the
    for getting `searchfox-cli` if you want to explore the codebase with an
    AI agent's help again later.
 
-5. **Set `MOZILLABUILD` and build:**
+   Also recreate the local git exclude entry (this doesn't travel with the
+   clone or the patches — see [Gotchas](#gotchas-read-before-debugging)):
    ```
-   $env:MOZILLABUILD = "<root>\mozilla-build"
-   ./mach.ps1 build
+   echo /clang/ >> .git/info/exclude
    ```
-   Or just run `.\.personal-build\update-and-build.ps1` — it sets this
-   itself, and additionally pulls latest upstream + rebases first (safe to
-   run even on a brand new checkout; it'll just be a no-op pull).
 
-6. **Run it:** `.\.personal-build\run-media-dump-build.bat` (or copy it up
-   one level next to `mozilla-build`/`mozilla-source` for convenience, like
-   the original layout had it).
+Once bootstrap is done, go to [Building](#2-building) below for the first
+real build.
 
-## Ongoing workflows
+---
 
-- **Pulling upstream updates while keeping this branch's changes:**
-  `.\.personal-build\update-and-build.ps1`. Rebases `media-dump` onto the
-  freshly-pulled `main`, re-purges the AI-agent breadcrumb files (see
-  below), and rebuilds. Auto-detects and recovers from the "upstream
-  changed low-level build files, need to clobber" failure mode.
-- **Packaging a build to move to another PC:**
-  `.\.personal-build\package-for-transport.ps1 -Installer`. Collects a
-  portable zip (and the installer .exe) into a timestamped folder under
-  `E:\mozilla\packaged-builds\` (adjust `-OutDir` if needed), with its own
-  `HOW-TO-RUN.txt`. **No special setup is needed on the target PC** for
-  this to work — capture writes go through the parent process now, so a
-  packaged/installed build just runs like a normal Firefox build.
+## 2. Building
 
-## Non-obvious gotchas discovered building this (read before debugging)
+**First build, or after a fresh bootstrap:**
+```
+$env:MOZILLABUILD = "<root>\mozilla-build"
+./mach.ps1 build
+```
+This is a full build and can take a long time (tens of minutes to a couple
+hours depending on hardware).
+
+**Day-to-day rebuilds** — same command, `mach` only redoes what's stale.
+If you only touched a `.cpp` file (not a header listed in a `moz.build`'s
+`EXPORTS`), `./mach build binaries` is faster (skips front-end/packaging
+steps) — see the stale-header gotcha below before relying on this after
+editing a header, though.
+
+**Run the build:**
+```
+.\.personal-build\run-media-dump-build.bat
+```
+(or `./mach run` directly, once `MOZILLABUILD` is set in your shell). A
+convenience copy of the `.bat` normally also sits one level up, sibling to
+`mozilla-source\`/`mozilla-build\`, for a double-clickable launcher.
+
+You do **not** need `MOZ_DISABLE_CONTENT_SANDBOX` for the media-dump feature
+to work — it writes through a parent-process IPC round trip now, not a
+direct file write from the sandboxed content process.
+
+---
+
+## 3. Updating (pull upstream, keep your changes)
+
+```
+.\.personal-build\update-and-build.ps1
+```
+
+What it does, in order:
+1. Refuses to run if you're not on `media-dump` or have uncommitted changes
+   (stops and tells you, doesn't guess).
+2. `git fetch origin`, then hard-resets `main` to `origin/main` — safe only
+   because `main` is a pure mirror with **zero** local commits, by
+   convention (never commit directly to `main`).
+3. Rebases `media-dump` onto the refreshed `main`. If this hits conflicts,
+   it stops and prints the conflicting files — resolve by hand
+   (`git rebase --continue`); the script never auto-resolves or aborts a
+   rebase for you.
+4. Re-purges the AI-agent breadcrumb files (see
+   [Gotchas](#gotchas-read-before-debugging)) — upstream keeps re-adding
+   these on every pull, so this step is what keeps them gone.
+5. Runs `mach build`. If it fails with a message mentioning "clobber"
+   (upstream vendored something that invalidates the object dir — has
+   happened before with a libwebrtc bump), it auto-clobbers and retries
+   once, since that failure mode is routine, not something to stop and ask
+   about each time.
+
+Flags: `-SkipBuild` (stop after the git/purge steps, don't build) and
+`-Package` (also run `mach build package` at the end — prefer
+`package-for-transport.ps1` instead when you actually want to ship the
+result somewhere, since it collects and labels the artifacts properly
+instead of leaving them buried under the obj dir).
+
+---
+
+## 4. Packaging & moving to another PC
+
+```
+.\.personal-build\package-for-transport.ps1 -Installer
+```
+
+This builds the **current** state (run `update-and-build.ps1` first if you
+want latest upstream folded in) and produces `mach build package`'s
+artifacts, then collects them into a timestamped, commit-labeled folder:
+
+```
+E:\mozilla\packaged-builds\<yyyy-MM-dd_HHmmss>-<short-commit>\
+    firefox-*.zip                    <- portable build
+    firefox-*.installer.exe          <- Windows installer (only with -Installer)
+    HOW-TO-RUN.txt                   <- generated, self-contained instructions
+```
+
+`-Installer` controls whether the installer `.exe` gets copied into that
+folder too — it's always built as an automatic side effect of
+`mach build package` on Windows either way (there's no separate
+`mach build installer` target; that name doesn't exist, confirmed by trying
+it and getting "No rule to make target 'installer'").
+
+`-OutDir <path>` changes the collection folder (default
+`E:\mozilla\packaged-builds`).
+
+**On the target PC:** copy the timestamped folder over (USB, network share,
+whatever) and either extract-and-run the `.zip`'s `firefox.exe` directly, or
+run the installer `.exe` like any normal Windows installer. **No special
+setup, env vars, or sandbox flags are needed on the target machine** — the
+media-dump feature works through the normal content sandbox, so a
+packaged/installed build behaves exactly like a stock portable/installed
+Firefox build from the outside.
+
+---
+
+## Gotchas (read before debugging)
 
 - **`MOZILLABUILD` isn't auto-detected.** `mach` defaults to expecting
   MozillaBuild at `C:\mozilla-build`; if it's anywhere else, `mach` fails
@@ -135,9 +226,8 @@ of public upstream history would be wasteful. What's archived is only the
   `clang/` toolchain download** (hundreds of MB) since it isn't covered by
   a committed `.gitignore` — it's excluded via this checkout's local
   `.git/info/exclude` instead (which doesn't travel with clones/patches,
-  so recreate that entry: add a `/clang/` line to the new checkout's own
-  `.git/info/exclude`). Always stage by explicit path in this repo, never
-  a wildcard.
+  so recreate that entry — see step 4 of Bootstrap above). Always stage by
+  explicit path in this repo, never a wildcard.
 - **The AI-agent breadcrumb files are deliberately deleted, not missing by
   accident.** `.agents/skills/`, `.claude/skills/`, `.claude/settings.json`,
   `.codex/config.toml`, and top-level `README.md`/`CODE_OF_CONDUCT.md`/
@@ -153,7 +243,7 @@ of public upstream history would be wasteful. What's archived is only the
   losing anything, specifically because nothing is ever committed there
   directly.
 
-## Feature summary (as of this archive)
+## Feature summary
 
 - Right-click "Save Video As"/"Save Audio As" on a playing `<video>`/
   `<audio>` element: works even when there's no reusable network URL
