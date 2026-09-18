@@ -56,6 +56,11 @@ of public upstream history would be wasteful. What's archived is only the
    why several things needed real bug fixes discovered only through actual
    `ffprobe`-verified testing, not just compiling).
 
+   This exact procedure has been verified: a throwaway branch created from
+   a plain `main` had all 12 patches applied via `git am`, and the result
+   was byte-for-byte identical (`git diff --stat` empty) to the real
+   `media-dump` branch. It works.
+
 4. **Bootstrap the toolchain:**
    ```
    ./mach bootstrap
